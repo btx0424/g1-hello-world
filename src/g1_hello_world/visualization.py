@@ -44,20 +44,32 @@ class ViserVisualizer:
 
     def add_camera_image(
         self,
+        name: str,
         hwc: tuple[int, int, int],
         *,
-        render_width: float,
-        render_height: float,
-    ) -> viser.ImageHandle:
-        return self.server.scene.add_image(
-            "/realsense/color",
-            np.zeros(hwc, dtype=np.uint8),
-            render_width=render_width,
-            render_height=render_height,
+        fov_y: float,
+        aspect: float,
+        frustum_depth: float,
+        line_width: float = 2.0,
+        color: tuple[int, int, int] = (48, 48, 48),
+    ) -> viser.CameraFrustumHandle:
+        """Frustum in OpenCV camera convention (+Z forward); pose in world from caller."""
+        image = np.zeros(hwc, dtype=np.uint8)
+        handle = self.server.scene.add_camera_frustum(
+            name=name,
+            fov=fov_y,
+            aspect=aspect,
+            scale=1.0,
+            line_width=line_width,
+            color=color,
+            image=image,
             format="jpeg",
             jpeg_quality=85,
-            position=(0.0, 0.0, 0.0),
+            variant="wireframe",
         )
+        _z = handle.compute_canonical_frustum_size()[2]
+        handle.scale = frustum_depth / _z
+        return handle
 
     def add_robot(self, robot_model: RobotModelWrapper) -> ViserRobotModelHandle:
         return ViserRobotModelHandle(self.server.scene, robot_model)

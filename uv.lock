@@ -291,7 +291,7 @@ wheels = [
 [[package]]
 name = "g1-hello-world"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "mujoco" },
     { name = "onnxruntime" },
