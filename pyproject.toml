@@ -1,7 +1,7 @@
 [project]
 name = "g1-hello-world"
 version = "0.1.0"
-description = "Add your description here"
+description = "Prototype viewer for Unitree G1 state, MuJoCo geometry, and RealSense video."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -12,3 +12,13 @@ dependencies = [
     "rerun-sdk>=0.30.2",
     "viser>=1.0.24",
 ]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
