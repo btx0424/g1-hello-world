@@ -1,19 +1,24 @@
+from __future__ import annotations
+
 import time
 import argparse
 import threading
+import itertools
+from functools import update_wrapper
 from pathlib import Path
+from weakref import WeakKeyDictionary
 
 import trimesh
 import numpy as np
 import pyrealsense2 as rs
 import viser
 import mujoco
-from typing import Tuple
+from typing import Any, Callable, Tuple
 from scipy.spatial.transform import Rotation as sRot
 
 from unitree_sdk2py.core.channel import ChannelPublisher, ChannelSubscriber, ChannelFactoryInitialize
-from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowCmd_
-from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_
+from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowCmd_, LowState_
+from unitree_sdk2py.idl.unitree_go.msg.dds_ import SportModeState_
 
 from unitree_sdk2py.comm.motion_switcher.motion_switcher_client import MotionSwitcherClient
 
@@ -26,6 +31,61 @@ R_SITE_FROM_OPENCV = np.array(
     [[0.0, 0.0, 1.0], [-1.0, 0.0, 0.0], [0.0, -1.0, 0.0]],
     dtype=np.float64,
 )
+
+
+class _BoundTimed:
+    __slots__ = ("_fn", "_inst", "_last_t", "_ema_dt", "_alpha")
+
+    def __init__(self, fn: Callable[..., Any], inst: Any, *, alpha: float) -> None:
+        self._fn = fn
+        self._inst = inst
+        self._last_t: float | None = None
+        self._ema_dt: float | None = None
+        self._alpha = alpha
+
+    @property
+    def freq(self) -> float:
+        if self._ema_dt is None or self._ema_dt <= 0.0:
+            return 0.0
+        return 1.0 / self._ema_dt
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        now = time.monotonic()
+        if self._last_t is not None:
+            dt = now - self._last_t
+            if self._ema_dt is None:
+                self._ema_dt = dt
+            else:
+                self._ema_dt = (1.0 - self._alpha) * self._ema_dt + self._alpha * dt
+        self._last_t = now
+        return self._fn(self._inst, *args, **kwargs)
+
+
+class _TimedMethod:
+    """Descriptor: instance access returns a callable with a `.freq` property (Hz)."""
+
+    def __init__(self, fn: Callable[..., Any], *, alpha: float = 0.2) -> None:
+        self._fn = fn
+        self._alpha = alpha
+        self._bound: WeakKeyDictionary[Any, _BoundTimed] = WeakKeyDictionary()
+        update_wrapper(self, fn)
+
+    def __get__(self, instance: Any, owner: type | None) -> _BoundTimed | _TimedMethod:
+        if instance is None:
+            return self
+        if instance not in self._bound:
+            self._bound[instance] = _BoundTimed(self._fn, instance, alpha=self._alpha)
+        return self._bound[instance]
+
+
+def timer_decorator(
+    fn: Callable[..., Any] | None = None, *, alpha: float = 0.2
+) -> _TimedMethod | Callable[[Callable[..., Any]], _TimedMethod]:
+    """Track callback rate with an EMA of inter-arrival times. Use ``self.Handler.freq`` (Hz)."""
+
+    if fn is None:
+        return lambda f: _TimedMethod(f, alpha=alpha)
+    return _TimedMethod(fn, alpha=alpha)
 
 
 def _geom_mesh_trimesh(model: mujoco.MjModel, gid: int) -> trimesh.Trimesh:
@@ -235,7 +295,10 @@ class Manager:
 
         # create subscriber # 
         self.lowstate_subscriber = ChannelSubscriber("rt/lowstate", LowState_)
-        self.lowstate_subscriber.Init(self.LowStateHandler, 10)
+        self.lowstate_subscriber.Init(self.LowStateHandler, 1)
+
+        self.odom_subscriber = ChannelSubscriber("rt/odommodestate", SportModeState_)
+        self.odom_subscriber.Init(self.SportModeStateHandler, 1)
 
     def _stream_camera_to_viser(self):
         while not self._camera_stop.is_set():
@@ -249,9 +312,10 @@ class Manager:
             bgr = np.asanyarray(color_frame.get_data())
             rgb = bgr[:, :, ::-1]
             self.camera_image_handle.image = rgb
-            with self._d435_pose_lock:
-                pos_link, R_world_from_link = self._d435_pose
+            
+            pos_link, R_world_from_link = self.robot_model.get_site_frame("d435")
             pos_link = np.asarray(pos_link, dtype=np.float64)
+
             R_world_from_link = np.asarray(R_world_from_link, dtype=np.float64).reshape(3, 3)
             d = self._cam_image_depth
             # OpenCV/COLMAP world rotation: columns are +X right, +Y down, +Z forward in world.
@@ -265,7 +329,8 @@ class Manager:
 
     def switch_mode(self):
         pass
-
+    
+    @timer_decorator
     def LowStateHandler(self, msg: LowState_):
         jpos = []
         jvel = []
@@ -275,14 +340,29 @@ class Manager:
         self.jpos = np.asarray(jpos)
         self.jvel = np.asarray(jvel)
         self.quat_wxyz = np.asarray(msg.imu_state.quaternion)
-        
         self._qpos[3 : 7] = self.quat_wxyz
         self._qpos[7 : 7 + len(self.jpos)] = self.jpos
+    
+    @timer_decorator
+    def SportModeStateHandler(self, msg: SportModeState_):
+        self._qpos[0:3] = msg.position
+    
+    def run(self):
+        try:
+            for i in itertools.count():
+                self.robot_model.update(self._qpos)
+                self.robot_model_handle.update()
+                time.sleep(0.02)
 
-        self.robot_model.update(self._qpos)
-        self.robot_model_handle.update()
-        with self._d435_pose_lock:
-            self._d435_pose = self.robot_model.get_site_frame("d435")
+                if i % 50 == 0:
+                    print(f"LowStateHandler freq: {self.LowStateHandler.freq:.1f} Hz")
+                    print(f"SportModeStateHandler freq: {self.SportModeStateHandler.freq:.1f} Hz")
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self._camera_stop.set()
+            self._camera_thread.join(timeout=2.0)
+            self.rs_pipeline.stop()
 
 
 def main():
@@ -291,16 +371,7 @@ def main():
     iface = "eth0"
     ChannelFactoryInitialize(0, iface)
     manager = Manager()
-
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        manager._camera_stop.set()
-        manager._camera_thread.join(timeout=2.0)
-        manager.rs_pipeline.stop()
+    manager.run()
 
 
 if __name__ == "__main__":
