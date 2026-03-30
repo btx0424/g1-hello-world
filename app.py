@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import itertools
 import math
 import threading
@@ -7,7 +8,6 @@ import time
 
 import mujoco
 import numpy as np
-import pyrealsense2 as rs
 import trimesh
 
 from unitree_sdk2py.comm.motion_switcher.motion_switcher_client import (
@@ -22,132 +22,17 @@ from g1_hello_world.realsense_device import RealSenseDeviceManager
 from g1_hello_world.robot_model import RobotModelWrapper
 from g1_hello_world.timing import timer_decorator
 from g1_hello_world.visualization import ViserVisualizer
-
-
-class GroundPlaneEstimator:
-    """
-    Estimates a dominant plane from aligned RealSense depth (RGB-D), assuming the
-    ground is visible in the lower image band. The fitted normal is flipped so it
-    aligns with world +Z (MuJoCo / robot world up).
-    """
-
-    def __init__(self, *, world_up: np.ndarray | None = None) -> None:
-        u = np.asarray(
-            world_up if world_up is not None else (0.0, 0.0, 1.0),
-            dtype=np.float64,
-        )
-        self._world_up = u / np.linalg.norm(u)
-
-    def fit_and_visualize(
-        self,
-        *,
-        scene,
-        pipeline: rs.pipeline,
-        K: np.ndarray,
-        robot_model: RobotModelWrapper,
-        image_width: int,
-        image_height: int,
-        site_name: str = "d435",
-        half_size: float = 2.5,
-        min_points: int = 250,
-        max_attempts: int = 45,
-    ) -> None:
-        align = rs.align(rs.stream.color)
-        fx, fy, cx, cy = float(K[0, 0]), float(K[1, 1]), float(K[0, 2]), float(K[1, 2])
-        pos_link, world_from_link = robot_model.get_site_frame(site_name)
-        world_from_cv = world_from_link @ R_SITE_FROM_OPENCV
-
-        bottom_v0 = int(image_height * 0.62)
-        stride = 4
-        pts: list[np.ndarray] = []
-
-        for _ in range(max_attempts):
-            frames = pipeline.wait_for_frames()
-            aligned = align.process(frames)
-            depth_frame = aligned.get_depth_frame()
-            if not depth_frame:
-                continue
-
-            pts.clear()
-            for v in range(bottom_v0, image_height, stride):
-                for u in range(0, image_width, stride):
-                    d = depth_frame.get_distance(int(u), int(v))
-                    if d <= 0.0 or d > 6.0 or not np.isfinite(d):
-                        continue
-                    x = (float(u) - cx) * d / fx
-                    y = (float(v) - cy) * d / fy
-                    z = d
-                    p_cv = np.array([x, y, z], dtype=np.float64)
-                    p_w = pos_link + world_from_cv @ p_cv
-                    if np.all(np.isfinite(p_w)):
-                        pts.append(p_w)
-            if len(pts) >= min_points:
-                break
-
-        if len(pts) < min_points:
-            print(
-                f"GroundPlaneEstimator: too few depth points ({len(pts)} < {min_points}); "
-                "skipping plane fit."
-            )
-            return
-
-        P = np.stack(pts, axis=0)
-        centroid = P.mean(axis=0)
-        _, _, vh = np.linalg.svd(P - centroid, full_matrices=False)
-        normal = vh[-1].astype(np.float64)
-        if float(np.dot(normal, self._world_up)) < 0.0:
-            normal = -normal
-        normal /= np.linalg.norm(normal)
-
-        # Plane n·x + d = 0 with n the upward-pointing normal; d = -n·centroid
-        d = float(-np.dot(normal, centroid))
-        print(
-            "Ground plane (world): "
-            f"n=[{normal[0]:.3f}, {normal[1]:.3f}, {normal[2]:.3f}], "
-            f"d={d:.3f} ({len(pts)} points)"
-        )
-
-        mesh = _ground_plane_quad_trimesh(centroid, normal, half_size=half_size)
-        scene.add_mesh_trimesh(
-            "/ground_plane",
-            mesh,
-            wxyz=(1.0, 0.0, 0.0, 0.0),
-            position=(0.0, 0.0, 0.0),
-        )
-
-
-def _ground_plane_quad_trimesh(
-    point_on_plane: np.ndarray,
-    normal: np.ndarray,
-    *,
-    half_size: float,
-) -> trimesh.Trimesh:
-    normal = np.asarray(normal, dtype=np.float64)
-    normal /= np.linalg.norm(normal)
-    aux = np.array([0.0, 0.0, 1.0], dtype=np.float64)
-    if abs(float(np.dot(normal, aux))) > 0.92:
-        aux = np.array([1.0, 0.0, 0.0], dtype=np.float64)
-    t1 = np.cross(normal, aux)
-    t1 /= np.linalg.norm(t1)
-    t2 = np.cross(normal, t1)
-    corners = []
-    for sx, sy in (-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0):
-        corners.append(
-            point_on_plane + half_size * (sx * t1 + sy * t2),
-        )
-    verts = np.asarray(corners, dtype=np.float64)
-    faces = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int64)
-    mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
-    rgba = np.tile(
-        np.array([[90, 140, 95, 130]], dtype=np.uint8),
-        (mesh.faces.shape[0], 1),
-    )
-    mesh.visual.face_colors = rgba
-    return mesh
+from g1_hello_world.estimators import GroundPlaneEstimator, PointTrackerRemote
 
 
 class Manager:
-    def __init__(self, *, initial_pose_timeout_s: float = 10.0) -> None:
+    def __init__(
+        self,
+        *,
+        initial_pose_timeout_s: float = 10.0,
+        track_server_endpoint: str = "tcp://127.0.0.1:5555",
+        point_tracker_port: int = 0,
+    ) -> None:
         self._initial_pose_timeout_s = initial_pose_timeout_s
 
         self.msc = MotionSwitcherClient()
@@ -179,6 +64,12 @@ class Manager:
 
         self.visualizer = ViserVisualizer()
         self.ground_plane_estimator = GroundPlaneEstimator()
+        # self.point_tracker_remote = PointTrackerRemote(
+        #     server_endpoint=track_server_endpoint,
+        #     realsense_device=self._realsense,
+        #     use_internal_frame_loop=False,
+        # )
+
         self.camera_image_handle = self.visualizer.add_camera_image(
             "/realsense/color",
             (self._rs_height, self._rs_width, 3),
@@ -212,11 +103,30 @@ class Manager:
         if self._wait_for_initial_pose(self._initial_pose_timeout_s):
             self.ground_plane_estimator.fit_and_visualize(
                 scene=self.visualizer.server.scene,
-                pipeline=self._realsense.pipeline,
+                realsense=self._realsense,
                 K=self._realsense.K,
                 robot_model=self.robot_model,
                 image_width=self._rs_width,
                 image_height=self._rs_height,
+            )
+
+        if point_tracker_port > 0:
+
+            def _run_point_tracker_ui() -> None:
+                demo = self.point_tracker_remote.build_ui()
+                demo.queue()
+                demo.launch(
+                    server_name="0.0.0.0",
+                    server_port=point_tracker_port,
+                    share=False,
+                )
+
+            threading.Thread(target=_run_point_tracker_ui, daemon=True).start()
+            print(
+                "Point tracker UI (Gradio): open "
+                f"http://127.0.0.1:{point_tracker_port} — click “Start remote tracker”, "
+                "then capture / query / submit. Run the Track-On ZMQ server on "
+                f"{track_server_endpoint!r}."
             )
 
     def _wait_for_initial_pose(self, timeout_s: float) -> bool:
@@ -242,17 +152,15 @@ class Manager:
     def _stream_camera_to_viser(self) -> None:
         while not self._camera_stop.is_set():
             try:
-                frames = self._realsense.pipeline.wait_for_frames()
+                t0 = time.perf_counter()
+                rgb, depth = self._realsense.read_aligned_rgb_depth()
+                capture_ms = (time.perf_counter() - t0) * 1000.0
             except RuntimeError:
                 break
-
-            color_frame = frames.get_color_frame()
-            if not color_frame:
-                continue
-
-            bgr = np.asanyarray(color_frame.get_data())
-            rgb = bgr[:, :, ::-1]
             self.camera_image_handle.image = rgb
+            # self.point_tracker_remote.on_aligned_frame(
+            #     rgb, depth, capture_ms=capture_ms
+            # )
 
             pos_link, world_from_link = self.robot_model.get_site_frame("d435")
             world_from_cv = world_from_link @ R_SITE_FROM_OPENCV
@@ -296,13 +204,34 @@ class Manager:
         finally:
             self._camera_stop.set()
             self._camera_thread.join(timeout=2.0)
+            self.point_tracker_remote.stop()
             self._realsense.stop()
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="G1 hello-world Viser + RealSense viewer")
+    parser.add_argument("--iface", default="eth0", help="Network interface for DDS")
+    parser.add_argument(
+        "--point-tracker-port",
+        type=int,
+        default=0,
+        help="Gradio port for remote point tracker UI; 0 disables (example: 7861)",
+    )
+    parser.add_argument(
+        "--track-server",
+        default="tcp://127.0.0.1:5555",
+        help="ZMQ endpoint for Track-On server (same as track_on client)",
+    )
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
 
-    iface = "eth0"
-    ChannelFactoryInitialize(0, iface)
+    args = _parse_args()
+    ChannelFactoryInitialize(0, args.iface)
 
-    manager = Manager()
+    manager = Manager(
+        point_tracker_port=args.point_tracker_port,
+        track_server_endpoint=args.track_server,
+    )
     manager.run()
