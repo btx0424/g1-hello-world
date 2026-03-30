@@ -1,9 +1,16 @@
 from __future__ import annotations
 
+import threading
+import time
+from collections.abc import Callable
+from typing import Optional
+
 import mujoco
 import numpy as np
 import viser
 
+from .constants import R_SITE_FROM_OPENCV
+from .realsense_device import RealSenseDeviceManager
 from .robot_model import RobotModelWrapper
 
 
@@ -38,27 +45,34 @@ class ViserRobotModelHandle:
             mesh_handle.wxyz = quat
 
 
-class ViserVisualizer:
-    def __init__(self) -> None:
-        self.server = viser.ViserServer()
+class ViserCameraHandle:
+    """
+    RealSense RGB frustum in Viser; runs a background loop that grabs aligned
+    RGB-D, pushes images, and (optionally) updates pose from a robot site frame.
+    """
 
-    def add_camera_image(
+    def __init__(
         self,
+        scene: viser.SceneApi,
         name: str,
+        realsense_device: RealSenseDeviceManager,
         hwc: tuple[int, int, int],
         *,
-        fov_y: float,
-        aspect: float,
         frustum_depth: float,
+        robot_model: RobotModelWrapper | None = None,
+        site_name: str = "d435",
         line_width: float = 2.0,
         color: tuple[int, int, int] = (48, 48, 48),
-    ) -> viser.CameraFrustumHandle:
-        """Frustum in OpenCV camera convention (+Z forward); pose in world from caller."""
+    ) -> None:
+        self._realsense = realsense_device
+        self._robot_model = robot_model
+        self._site_name = site_name
+
         image = np.zeros(hwc, dtype=np.uint8)
-        handle = self.server.scene.add_camera_frustum(
+        self.frustum = scene.add_camera_frustum(
             name=name,
-            fov=fov_y,
-            aspect=aspect,
+            fov=self._realsense.fov_y,
+            aspect=self._realsense.aspect,
             scale=1.0,
             line_width=line_width,
             color=color,
@@ -67,10 +81,65 @@ class ViserVisualizer:
             jpeg_quality=85,
             variant="wireframe",
         )
-        _z = handle.compute_canonical_frustum_size()[2]
-        handle.scale = frustum_depth / _z
+        _z = self.frustum.compute_canonical_frustum_size()[2]
+        self.frustum.scale = frustum_depth / _z
+
+    @property
+    def image_frustum(self) -> viser.CameraFrustumHandle:
+        return self.frustum
+
+    def update(self) -> None:
+        self.frustum.image = self._realsense.rgb
+        if self._robot_model is not None:
+            pos_link, world_from_link = self._robot_model.get_site_frame(
+                self._site_name
+            )
+            world_from_cv = world_from_link @ R_SITE_FROM_OPENCV
+            wxyz = np.zeros(4, dtype=np.float64)
+            mujoco.mju_mat2Quat(wxyz, world_from_cv.flatten(order="C"))
+            self.frustum.position = pos_link
+            self.frustum.wxyz = wxyz
+
+
+class ViserVisualizer:
+    def __init__(self) -> None:
+        self.server = viser.ViserServer()
+        self.robot_model_handles: list[ViserRobotModelHandle] = []
+        self.camera_handles: list[ViserCameraHandle] = []
+
+    def update(self) -> None:
+        for handle in self.robot_model_handles:
+            handle.update()
+        for handle in self.camera_handles:
+            handle.update()
+
+    def add_camera(
+        self,
+        name: str,
+        realsense_device: RealSenseDeviceManager,
+        hwc: tuple[int, int, int],
+        *,
+        frustum_depth: float,
+        robot_model: RobotModelWrapper | None = None,
+        site_name: str = "d435",
+        line_width: float = 2.0,
+        color: tuple[int, int, int] = (48, 48, 48),
+    ) -> ViserCameraHandle:
+        handle = ViserCameraHandle(
+            self.server.scene,
+            name,
+            realsense_device,
+            hwc,
+            frustum_depth=frustum_depth,
+            robot_model=robot_model,
+            site_name=site_name,
+            line_width=line_width,
+            color=color,
+        )
+        self.camera_handles.append(handle)
         return handle
 
     def add_robot(self, robot_model: RobotModelWrapper) -> ViserRobotModelHandle:
-        return ViserRobotModelHandle(self.server.scene, robot_model)
-
+        handle = ViserRobotModelHandle(self.server.scene, robot_model)
+        self.robot_model_handles.append(handle)
+        return handle

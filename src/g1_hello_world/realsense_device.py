@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 import numpy as np
 import pyrealsense2 as rs
@@ -122,9 +123,9 @@ class RealSenseDeviceManager:
             raise RuntimeError("Missing color or depth frame from RealSense.")
         bgr = np.asanyarray(color_frame.get_data())
         depth = np.asanyarray(depth_frame.get_data())
-        rgb = np.ascontiguousarray(bgr[:, :, ::-1])
-        depth = np.ascontiguousarray(depth)
-        return rgb, depth
+        self.rgb = np.ascontiguousarray(bgr[:, :, ::-1])
+        self.depth = np.ascontiguousarray(depth)
+        return self.rgb, self.depth
 
     @property
     def K(self) -> np.ndarray:
@@ -142,7 +143,20 @@ class RealSenseDeviceManager:
     @property
     def fps(self) -> int:
         return self._fps
-    
+
+    @property
+    def fov_y(self) -> float:
+        """Vertical field of view in radians (pinhole model from primary intrinsics)."""
+        fy = float(self._K[1, 1])
+        if fy <= 0.0:
+            raise ValueError("Invalid focal length fy for FOV computation.")
+        return 2.0 * math.atan(self._height / (2.0 * fy))
+
+    @property
+    def aspect(self) -> float:
+        """Width divided by height for the configured stream resolution."""
+        return float(self._width) / float(self._height)
+
     def compute_camera_points(
         self,
         depth: np.ndarray,

@@ -2,11 +2,9 @@ from __future__ import annotations
 
 import argparse
 import itertools
-import math
 import threading
 import time
 
-import mujoco
 import numpy as np
 import trimesh
 
@@ -17,7 +15,6 @@ from unitree_sdk2py.core.channel import ChannelSubscriber, ChannelFactoryInitial
 from unitree_sdk2py.idl.unitree_go.msg.dds_ import SportModeState_
 from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_
 
-from g1_hello_world.constants import R_SITE_FROM_OPENCV
 from g1_hello_world.realsense_device import RealSenseDeviceManager
 from g1_hello_world.robot_model import RobotModelWrapper
 from g1_hello_world.timing import timer_decorator
@@ -58,25 +55,19 @@ class Manager:
 
         # Distance from optical center to the frustum image plane (matches pinhole FOV).
         self._cam_image_depth = 0.4
-        fy = float(self._realsense.K[1, 1])
-        fov_y = 2.0 * math.atan(self._rs_height / (2.0 * fy))
-        aspect = float(self._rs_width) / float(self._rs_height)
 
         self.visualizer = ViserVisualizer()
         self.ground_plane_estimator = GroundPlaneEstimator()
-        # self.point_tracker_remote = PointTrackerRemote(
-        #     server_endpoint=track_server_endpoint,
-        #     realsense_device=self._realsense,
-        #     use_internal_frame_loop=False,
-        # )
 
-        self.camera_image_handle = self.visualizer.add_camera_image(
-            "/realsense/color",
-            (self._rs_height, self._rs_width, 3),
-            fov_y=fov_y,
-            aspect=aspect,
-            frustum_depth=self._cam_image_depth,
-        )
+        self.point_tracker_remote: PointTrackerRemote | None = None
+        on_frame = None
+        if point_tracker_port > 0:
+            self.point_tracker_remote = PointTrackerRemote(
+                server_endpoint=track_server_endpoint,
+                realsense_device=self._realsense,
+                use_internal_frame_loop=False,
+            )
+
         self.robot_model = RobotModelWrapper("robot_model/g1_29dof_rev_1_0.xml")
         self.robot_model_handle = self.visualizer.add_robot(self.robot_model)
         self._qpos = np.zeros(self.robot_model.mj_model.nq, dtype=np.float64)
@@ -84,15 +75,20 @@ class Manager:
         self.robot_model.update(self._qpos)
         self.robot_model_handle.update()
 
+        self._camera_handle = self.visualizer.add_camera(
+            "/realsense/color",
+            self._realsense,
+            (self._rs_height, self._rs_width, 3),
+            frustum_depth=self._cam_image_depth,
+            robot_model=self.robot_model,
+            on_frame=on_frame,
+        )
+
         self._initial_odom = threading.Event()
         self._initial_lowstate = threading.Event()
 
         self._camera_stop = threading.Event()
-        self._camera_thread = threading.Thread(
-            target=self._stream_camera_to_viser,
-            daemon=True,
-        )
-        self._camera_thread.start()
+        self._camera_handle.start_stream(self._camera_stop)
 
         self.lowstate_subscriber = ChannelSubscriber("rt/lowstate", LowState_)
         self.lowstate_subscriber.Init(self.LowStateHandler, 1)
@@ -110,23 +106,32 @@ class Manager:
                 image_height=self._rs_height,
             )
 
-        if point_tracker_port > 0:
+        # if point_tracker_port > 0 and self.point_tracker_remote is not None:
+        #     _tracker = self.point_tracker_remote
 
-            def _run_point_tracker_ui() -> None:
-                demo = self.point_tracker_remote.build_ui()
-                demo.queue()
-                demo.launch(
-                    server_name="0.0.0.0",
-                    server_port=point_tracker_port,
-                    share=False,
-                )
+        #     def _run_point_tracker_ui() -> None:
+        #         demo = _tracker.build_ui()
+        #         demo.queue()
+        #         demo.launch(
+        #             server_name="0.0.0.0",
+        #             server_port=point_tracker_port,
+        #             share=False,
+        #         )
 
-            threading.Thread(target=_run_point_tracker_ui, daemon=True).start()
-            print(
-                "Point tracker UI (Gradio): open "
-                f"http://127.0.0.1:{point_tracker_port} — click “Start remote tracker”, "
-                "then capture / query / submit. Run the Track-On ZMQ server on "
-                f"{track_server_endpoint!r}."
+        #     threading.Thread(target=_run_point_tracker_ui, daemon=True).start()
+        #     print(
+        #         "Point tracker UI (Gradio): open "
+        #         f"http://127.0.0.1:{point_tracker_port} — click “Start remote tracker”, "
+        #         "then capture / query / submit. Run the Track-On ZMQ server on "
+        #         f"{track_server_endpoint!r}."
+        #     )
+
+    def _forward_point_tracker_frame(
+        self, rgb: np.ndarray, depth: np.ndarray, capture_ms: float
+    ) -> None:
+        if self.point_tracker_remote is not None:
+            self.point_tracker_remote.on_aligned_frame(
+                rgb, depth, capture_ms=capture_ms
             )
 
     def _wait_for_initial_pose(self, timeout_s: float) -> bool:
@@ -149,27 +154,6 @@ class Manager:
         )
         return False
 
-    def _stream_camera_to_viser(self) -> None:
-        while not self._camera_stop.is_set():
-            try:
-                t0 = time.perf_counter()
-                rgb, depth = self._realsense.read_aligned_rgb_depth()
-                capture_ms = (time.perf_counter() - t0) * 1000.0
-            except RuntimeError:
-                break
-            self.camera_image_handle.image = rgb
-            # self.point_tracker_remote.on_aligned_frame(
-            #     rgb, depth, capture_ms=capture_ms
-            # )
-
-            pos_link, world_from_link = self.robot_model.get_site_frame("d435")
-            world_from_cv = world_from_link @ R_SITE_FROM_OPENCV
-
-            wxyz = np.zeros(4, dtype=np.float64)
-            mujoco.mju_mat2Quat(wxyz, world_from_cv.flatten(order="C"))
-            self.camera_image_handle.position = pos_link
-            self.camera_image_handle.wxyz = wxyz
-
     def switch_mode(self) -> None:
         pass
 
@@ -191,7 +175,8 @@ class Manager:
         try:
             for step in itertools.count():
                 self.robot_model.update(self._qpos)
-                self.robot_model_handle.update()
+                self._realsense.read_aligned_rgb_depth()
+                self.visualizer.update()
                 time.sleep(0.02)
 
                 if step % 50 == 0:
@@ -203,8 +188,9 @@ class Manager:
             pass
         finally:
             self._camera_stop.set()
-            self._camera_thread.join(timeout=2.0)
-            self.point_tracker_remote.stop()
+            self.visualizer.join_camera_streams(timeout=2.0)
+            if self.point_tracker_remote is not None:
+                self.point_tracker_remote.stop()
             self._realsense.stop()
 
 
