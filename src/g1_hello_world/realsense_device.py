@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import threading
 
 import numpy as np
 import pyrealsense2 as rs
@@ -18,9 +19,9 @@ class RealSenseDeviceManager:
     Owns a single RealSense pipeline (one device). Pass ``serial`` to pick a camera
     when several are connected; otherwise the SDK default device is used.
 
-    With both color and depth enabled, use :meth:`read_aligned_rgb_depth` for a
-    single ``wait_for_frames`` call that returns **RGB** (``H×W×3``, ``uint8``) and
-    **depth** (``H×W``, ``uint16`` raw units) **registered to the color image**.
+    Call :meth:`start` to run capture on a background thread; :meth:`read_aligned_rgb_depth`
+    returns copies of the latest aligned RGB (``H×W×3``, ``uint8``) and depth (``H×W``, ``uint16``).
+    :attr:`rgb` and :attr:`depth` are updated by that thread for live preview (e.g. Viser).
     """
 
     def __init__(
@@ -91,6 +92,14 @@ class RealSenseDeviceManager:
         else:
             self._align_to_color = None
 
+        self.rgb = np.zeros((height, width, 3), dtype=np.uint8)
+        self.depth = np.zeros((height, width), dtype=np.uint16)
+
+        self._frame_lock = threading.Lock()
+        self._stream_stop = threading.Event()
+        self.frame_ready = threading.Event()
+        self._stream_thread: threading.Thread | None = None
+
     @property
     def pipeline(self) -> rs.pipeline:
         """Low-level pipeline. Prefer :meth:`read_aligned_rgb_depth` for RGB-D."""
@@ -101,7 +110,7 @@ class RealSenseDeviceManager:
         """Meters per raw depth unit (multiply ``uint16`` depth by this for meters)."""
         return self._depth_scale
 
-    def read_aligned_rgb_depth(self) -> tuple[np.ndarray, np.ndarray]:
+    def _read_frames(self) -> tuple[np.ndarray, np.ndarray]:
         """
         Wait for one frameset, align depth to color, return ``(rgb, depth)``.
 
@@ -123,9 +132,51 @@ class RealSenseDeviceManager:
             raise RuntimeError("Missing color or depth frame from RealSense.")
         bgr = np.asanyarray(color_frame.get_data())
         depth = np.asanyarray(depth_frame.get_data())
-        self.rgb = np.ascontiguousarray(bgr[:, :, ::-1])
-        self.depth = np.ascontiguousarray(depth)
-        return self.rgb, self.depth
+        rgb = np.ascontiguousarray(bgr[:, :, ::-1])
+        depth_u16 = np.ascontiguousarray(depth)
+        with self._frame_lock:
+            self.rgb = rgb
+            self.depth = depth_u16
+        return rgb, depth_u16
+
+    def read_aligned_rgb_depth(self, *, timeout_s: float = 10.0) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Latest aligned RGB and depth from the capture thread (copies of the same buffers
+        as :attr:`rgb` / :attr:`depth`).
+
+        Requires :meth:`start` so frames are arriving; blocks up to ``timeout_s`` for the
+        first frame, then returns promptly on later calls.
+        """
+        if self._align_to_color is None:
+            raise RuntimeError(
+                "read_aligned_rgb_depth requires both color and depth streams."
+            )
+        if not self.frame_ready.wait(timeout_s):
+            raise RuntimeError(
+                "Timed out waiting for a RealSense frame — call start() on the device."
+            )
+        with self._frame_lock:
+            return self.rgb.copy(), self.depth.copy()
+
+    def _stream_loop(self) -> None:
+        while not self._stream_stop.is_set():
+            try:
+                self._read_frames()
+                self.frame_ready.set()
+            except Exception:
+                break
+
+    def start(self) -> None:
+        """Begin background capture (``wait_for_frames`` on a daemon thread)."""
+        if self._stream_thread is not None and self._stream_thread.is_alive():
+            return
+        self._stream_stop.clear()
+        self._stream_thread = threading.Thread(
+            target=self._stream_loop,
+            name="realsense-capture",
+            daemon=True,
+        )
+        self._stream_thread.start()
 
     @property
     def K(self) -> np.ndarray:
@@ -210,4 +261,8 @@ class RealSenseDeviceManager:
         return out
 
     def stop(self) -> None:
+        self._stream_stop.set()
+        if self._stream_thread is not None:
+            self._stream_thread.join(timeout=5.0)
+            self._stream_thread = None
         self._pipeline.stop()

@@ -8,6 +8,7 @@ import trimesh
 from scipy.spatial.transform import Rotation as sRot
 
 from .constants import MJ_MESH
+from collections import defaultdict
 
 
 def geom_mesh_trimesh(model: mujoco.MjModel, gid: int) -> trimesh.Trimesh:
@@ -34,31 +35,38 @@ class RobotModelWrapper:
             mujoco.mj_id2name(self.mj_model, mujoco.mjtObj.mjOBJ_JOINT, joint_id)
             for joint_id in range(self.mj_model.njnt)
         ]
-        self.body_ids = list(range(1, self.mj_model.nbody))
+        self.body_adrs = list(range(1, self.mj_model.nbody)) # exclude world body
         self.body_names = [
-            mujoco.mj_id2name(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, body_id)
-            or f"body_{body_id}"
-            for body_id in self.body_ids
+            mujoco.mj_id2name(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, body_addr)
+            or f"body_{body_addr}"
+            for body_addr in self.body_adrs
         ]
 
-        meshes_by_body: dict[int, list[trimesh.Trimesh]] = {}
+        meshes_by_body: dict[str, list[trimesh.Trimesh]] = defaultdict(list)
         for geom_id in range(self.mj_model.ngeom):
-            if self.mj_model.geom_type[geom_id] != MJ_MESH:
+            geom = self.mj_model.geom(geom_id)
+            if geom.type != MJ_MESH:
                 continue
-            body_id = int(self.mj_model.geom_bodyid[geom_id])
-            meshes_by_body.setdefault(body_id, []).append(
+            # Skip collision duplicates (contype/conaffinity > 0); keep visual-only meshes.
+            if (
+                int(self.mj_model.geom_contype[geom_id]) != 0
+                or int(self.mj_model.geom_conaffinity[geom_id]) != 0
+            ):
+                continue
+            body_name = self.mj_model.body(int(self.mj_model.geom_bodyid[geom_id])).name
+            meshes_by_body[body_name].append(
                 geom_mesh_trimesh(self.mj_model, geom_id)
             )
 
-        self.body_meshes: list[trimesh.Trimesh | None] = []
-        for body_id in self.body_ids:
-            parts = meshes_by_body.get(body_id)
+        self.body_meshes: dict[str, trimesh.Trimesh | None] = {}
+        for body_name in self.body_names:
+            parts = meshes_by_body.get(body_name)
             if not parts:
-                self.body_meshes.append(None)
-            elif len(parts) > 1:
-                self.body_meshes.append(trimesh.util.concatenate(parts))
-            else:
-                self.body_meshes.append(parts[0])
+                continue
+            body_mesh = trimesh.util.concatenate(parts)
+            body_mesh.merge_vertices()
+            body_mesh = body_mesh.simplify_quadric_decimation(0.9)
+            self.body_meshes[body_name] = body_mesh
 
         self._site_ids: dict[str, int] = {}
 

@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import threading
 import time
-from collections.abc import Callable
-from typing import Optional
 
 import mujoco
 import numpy as np
@@ -12,18 +10,30 @@ import viser
 from .constants import R_SITE_FROM_OPENCV
 from .realsense_device import RealSenseDeviceManager
 from .robot_model import RobotModelWrapper
+from .utils.string import resolve_matching_names
 
 
 class ViserRobotModelHandle:
-    def __init__(self, scene: viser.SceneApi, robot_model: RobotModelWrapper) -> None:
+    def __init__(
+        self,
+        scene: viser.SceneApi,
+        robot_model: RobotModelWrapper,
+        body_names: str | list[str] = ".*", # all bodies by default
+    ) -> None:
         self.robot_model = robot_model
         self.mesh_handles: list[viser.GlbHandle | None] = []
-        for body_name, mesh in zip(
-            self.robot_model.body_names, self.robot_model.body_meshes, strict=True
-        ):
+        
+        body_ids, body_names = resolve_matching_names(body_names, self.robot_model.body_names)
+        
+        # visualized bodies' addresses and names
+        self.body_adrs = [self.robot_model.body_adrs[i] for i in body_ids]
+        self.body_names = [self.robot_model.body_names[i] for i in body_ids]
+        for body_name in self.body_names:
+            mesh = self.robot_model.body_meshes[body_name]
             if mesh is None:
                 self.mesh_handles.append(None)
                 continue
+            print(f"Adding mesh for body {body_name}")
             handle = scene.add_mesh_trimesh(
                 name=f"/robot/{body_name}",
                 mesh=mesh,
@@ -34,14 +44,14 @@ class ViserRobotModelHandle:
 
     def update(self) -> None:
         data = self.robot_model.mj_data
-        for body_id, mesh_handle in zip(
-            self.robot_model.body_ids, self.mesh_handles, strict=True
+        for body_addr, mesh_handle in zip(
+            self.body_adrs, self.mesh_handles, strict=True
         ):
             if mesh_handle is None:
                 continue
             quat = np.zeros(4, dtype=np.float64)
-            mujoco.mju_mat2Quat(quat, data.xmat[body_id])
-            mesh_handle.position = np.asarray(data.xpos[body_id], dtype=np.float64)
+            mujoco.mju_mat2Quat(quat, data.xmat[body_addr])
+            mesh_handle.position = np.asarray(data.xpos[body_addr], dtype=np.float64)
             mesh_handle.wxyz = quat
 
 
@@ -106,6 +116,8 @@ class ViserVisualizer:
         self.server = viser.ViserServer()
         self.robot_model_handles: list[ViserRobotModelHandle] = []
         self.camera_handles: list[ViserCameraHandle] = []
+        self._async_stop = threading.Event()
+        self._async_thread: threading.Thread | None = None
 
     def update(self) -> None:
         for handle in self.robot_model_handles:
@@ -139,7 +151,44 @@ class ViserVisualizer:
         self.camera_handles.append(handle)
         return handle
 
-    def add_robot(self, robot_model: RobotModelWrapper) -> ViserRobotModelHandle:
-        handle = ViserRobotModelHandle(self.server.scene, robot_model)
+    def add_robot(self, robot_model: RobotModelWrapper, body_names: str | list[str] = ".*") -> ViserRobotModelHandle:
+        handle = ViserRobotModelHandle(self.server.scene, robot_model, body_names)
         self.robot_model_handles.append(handle)
         return handle
+
+    def run_async(self, freq: float = 20.0) -> None:
+        """
+        Start a daemon thread that calls :meth:`update` at roughly ``freq`` Hz.
+
+        Call :meth:`stop_async` before discarding the visualizer or exiting the process.
+        Idempotent if a thread is already running.
+        """
+        if freq <= 0.0:
+            raise ValueError("freq must be positive")
+        if self._async_thread is not None and self._async_thread.is_alive():
+            return
+        period_s = 1.0 / float(freq)
+        self._async_stop.clear()
+
+        def _loop() -> None:
+            while not self._async_stop.is_set():
+                t0 = time.perf_counter()
+                self.update()
+                elapsed = time.perf_counter() - t0
+                slack = period_s - elapsed
+                if slack > 0.0:
+                    time.sleep(slack)
+
+        self._async_thread = threading.Thread(
+            target=_loop,
+            daemon=True,
+            name="viser-visualizer",
+        )
+        self._async_thread.start()
+
+    def stop_async(self, *, join_timeout_s: float = 2.0) -> None:
+        """Signal the async update loop to stop and wait for the thread to exit."""
+        self._async_stop.set()
+        if self._async_thread is not None:
+            self._async_thread.join(timeout=join_timeout_s)
+            self._async_thread = None

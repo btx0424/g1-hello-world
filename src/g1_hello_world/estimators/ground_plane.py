@@ -43,8 +43,10 @@ class GroundPlaneEstimator:
         stride = 4
         pts: list[np.ndarray] = []
 
+        assert realsense.frame_ready.is_set()
+
         for _ in range(max_attempts):
-            _, depth_u16 = realsense.read_aligned_rgb_depth()
+            depth_u16 = realsense.depth
 
             pts.clear()
             for v in range(bottom_v0, image_height, stride):

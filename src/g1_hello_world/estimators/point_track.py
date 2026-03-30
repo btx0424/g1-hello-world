@@ -1,13 +1,17 @@
 """
-Remote Track-On2-style point tracking: Gradio UI + ZMQ server, using an existing
-``RealSenseDeviceManager`` pipeline (aligned depth → ``compute_camera_points``).
+Remote Track-On2-style point tracking: Gradio UI + ZMQ, using ``RealSenseDeviceManager``.
+
+The camera runs **async capture** (:meth:`RealSenseDeviceManager.start`): a dedicated
+thread calls ``wait_for_frames``. This module **never** touches the pipeline directly;
+it either **polls** aligned snapshots via :meth:`RealSenseDeviceManager.read_aligned_rgb_depth`
+or accepts **pushed** RGB-D from the host with :meth:`PointTrackerRemote.on_aligned_frame`.
 """
 
 from __future__ import annotations
 
 import threading
 import time
-from typing import Any, Optional, Tuple
+from typing import Any
 
 import cv2
 import gradio as gr
@@ -30,17 +34,18 @@ def encode_rgb_jpeg(rgb: np.ndarray, quality: int) -> bytes:
 
 class PointTrackerRemote:
     """
-    Connect to a remote point-tracking server (same ZMQ ``track`` / ``ping`` API as
-    ``track_on/scripts/client.py``). Either runs its own aligned-frame worker, or
-    accepts frames from the host app via :meth:`on_aligned_frame` when
-        ``use_internal_frame_loop=False`` (one reader via
-        ``RealSenseDeviceManager.read_aligned_rgb_depth``).
+    ZMQ client for the same ``track`` / ``ping`` API as ``track_on/scripts/client.py``.
 
-    .. note::
-        With ``use_internal_frame_loop=True`` (default), only this class should drive
-        frame acquisition on the shared device. If the app already reads frames
-        (e.g. Viser), pass ``use_internal_frame_loop=False`` and push aligned
-        RGB + depth each frame with :meth:`on_aligned_frame`.
+    **Polling** (``use_internal_frame_loop=True``): a daemon thread repeatedly calls
+    ``read_aligned_rgb_depth`` (cheap lock + copy) while the RealSense **capture**
+    thread owns ``wait_for_frames``.
+
+    **Push** (``use_internal_frame_loop=False``, default): the host main loop must call
+    :meth:`on_aligned_frame` with the same aligned RGB-D the rest of the app uses
+    (e.g. Viser), so preview and 3-D lifting stay in sync.
+
+    The device must already be streaming: ``realsense_device.start()`` before
+    :meth:`PointTrackerRemote.start`.
     """
 
     def __init__(
@@ -48,7 +53,9 @@ class PointTrackerRemote:
         server_endpoint: str,
         realsense_device: RealSenseDeviceManager,
         *,
-        use_internal_frame_loop: bool = True,
+        use_internal_frame_loop: bool = False,
+        aligned_read_timeout_s: float = 2.0,
+        poll_period_s: float | None = None,
         jpeg_quality: int = 90,
         request_timeout_ms: int = 3000,
         point_radius: int = 5,
@@ -58,6 +65,8 @@ class PointTrackerRemote:
         self.server_endpoint = server_endpoint
         self._rs = realsense_device
         self._use_internal_frame_loop = use_internal_frame_loop
+        self._aligned_read_timeout_s = float(aligned_read_timeout_s)
+        self._poll_period_s = poll_period_s
         self.jpeg_quality = jpeg_quality
         self.request_timeout_ms = request_timeout_ms
         self.point_radius = point_radius
@@ -132,7 +141,7 @@ class PointTrackerRemote:
     def _send_track_request(
         self,
         rgb: np.ndarray,
-        queries_xy: Optional[list[tuple[int, int]]] = None,
+        queries_xy: list[tuple[int, int]] | None = None,
         *,
         reset: bool = False,
     ) -> dict[str, Any]:
@@ -187,7 +196,7 @@ class PointTrackerRemote:
         return out
 
     def _read_rgb_depth_aligned(self) -> tuple[np.ndarray, np.ndarray]:
-        return self._rs.read_aligned_rgb_depth()
+        return self._rs.read_aligned_rgb_depth(timeout_s=self._aligned_read_timeout_s)
 
     def _process_frame_rgb_depth(
         self,
@@ -268,8 +277,8 @@ class PointTrackerRemote:
             return
         t0 = time.perf_counter()
         self._process_frame_rgb_depth(
-            np.ascontiguousarray(rgb),
-            np.ascontiguousarray(depth),
+            np.ascontiguousarray(rgb, dtype=np.uint8),
+            np.ascontiguousarray(depth, dtype=np.uint16),
             capture_ms=capture_ms,
             t0_loop=t0,
         )
@@ -279,6 +288,12 @@ class PointTrackerRemote:
     def _worker_loop(self) -> None:
         self._fps_frame_count = 0
         self._fps_t0 = time.perf_counter()
+        default_period = max(1e-3, 1.0 / float(max(1, self._rs.fps)))
+        period = (
+            float(self._poll_period_s)
+            if self._poll_period_s is not None
+            else default_period
+        )
         while not self._worker_stop.is_set():
             t0 = time.perf_counter()
             try:
@@ -286,18 +301,28 @@ class PointTrackerRemote:
             except Exception as exc:
                 with self._lock:
                     self._set_status(f"Failed to read RealSense frames: {exc}")
-                time.sleep(0.01)
+                time.sleep(0.05)
                 continue
 
             capture_ms = (time.perf_counter() - t0) * 1000.0
             self._process_frame_rgb_depth(
                 rgb, depth, capture_ms=capture_ms, t0_loop=t0
             )
+            elapsed = time.perf_counter() - t0
+            slack = period - elapsed
+            if slack > 0:
+                time.sleep(slack)
 
     def start(self) -> str:
         """Ping the server and begin a session (internal worker and/or external feed)."""
         self.stop()
         server_status = self.ping_server()
+        if not self._rs.frame_ready.wait(timeout=5.0):
+            self._session_live = False
+            self._set_status(
+                "No camera frames yet — call RealSenseDeviceManager.start() before starting the tracker."
+            )
+            return self.status_message
         self._session_live = True
         self._fps_frame_count = 0
         self._fps_t0 = time.perf_counter()
@@ -308,11 +333,14 @@ class PointTrackerRemote:
             )
             self._worker_thread.start()
             self._set_status(
-                f"Remote tracker ({self._rs.width}x{self._rs.height} @ {self._rs.fps} FPS). {server_status}"
+                f"Remote tracker (poll snapshots, {self._rs.width}x{self._rs.height} @ {self._rs.fps} FPS). "
+                f"{server_status}"
             )
         else:
             self._worker_thread = None
-            self._set_status(f"Remote tracker (external RGB-D feed). {server_status}")
+            self._set_status(
+                f"Remote tracker (host must call on_aligned_frame each frame). {server_status}"
+            )
         return self.status_message
 
     def stop(self) -> str:
@@ -336,7 +364,7 @@ class PointTrackerRemote:
 
     def capture_for_queries(
         self,
-    ) -> Tuple[Optional[np.ndarray], str]:
+    ) -> tuple[np.ndarray | None, str]:
         with self._lock:
             if self.latest_rgb_frame is None:
                 self._set_status("Start the remote tracker first.")
@@ -353,7 +381,7 @@ class PointTrackerRemote:
 
     def add_query_click(
         self, evt: gr.SelectData
-    ) -> Tuple[Optional[np.ndarray], str]:
+    ) -> tuple[np.ndarray | None, str]:
         with self._lock:
             if self.frozen_frame is None:
                 self._set_status("Capture a frame for queries first.")
@@ -372,7 +400,7 @@ class PointTrackerRemote:
             )
             return self.query_overlay_rgb, self.status_message
 
-    def clear_queries(self) -> Tuple[Optional[np.ndarray], str]:
+    def clear_queries(self) -> tuple[np.ndarray | None, str]:
         with self._lock:
             self.query_points_xy = []
             if self.frozen_frame is not None:
@@ -419,7 +447,7 @@ class PointTrackerRemote:
             self._set_status("Tracking started via remote server.")
             return self.status_message
 
-    def tick(self) -> Tuple[Optional[np.ndarray], str, str]:
+    def tick(self) -> tuple[np.ndarray | None, str, str]:
         with self._lock:
             return (
                 self.latest_rgb_preview,
@@ -469,8 +497,20 @@ class PointTrackerRemote:
         return demo
 
     def run_ui(self, **launch_kwargs: Any) -> None:
-        """``start()`` then launch Gradio (blocking)."""
-        self.start()
-        demo = self.build_ui()
-        demo.queue()
-        demo.launch(**launch_kwargs)
+        """
+        ``start()`` then launch Gradio (blocking).
+
+        Forces internal snapshot polling for this run so the UI receives frames
+        without a host ``on_aligned_frame`` loop. Restores the previous
+        ``use_internal_frame_loop`` flag afterward.
+        """
+        saved_poll = self._use_internal_frame_loop
+        self._use_internal_frame_loop = True
+        try:
+            self.start()
+            demo = self.build_ui()
+            demo.queue()
+            demo.launch(**launch_kwargs)
+        finally:
+            self.stop()
+            self._use_internal_frame_loop = saved_poll

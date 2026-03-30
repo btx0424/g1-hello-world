@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import cv2 # type: ignore
 import argparse
 import itertools
 import threading
 import time
-
 import numpy as np
 import trimesh
+import logging
+
+logging.basicConfig(level=logging.INFO)
 
 from unitree_sdk2py.comm.motion_switcher.motion_switcher_client import (
     MotionSwitcherClient,
@@ -43,52 +46,37 @@ class Manager:
             print(f"Device found: {info.name} (serial={info.serial})")
 
         self._rs_width, self._rs_height, self._rs_fps = 640, 480, 30
-        self._realsense = RealSenseDeviceManager(
+        self.realsense = RealSenseDeviceManager(
             self._rs_width,
             self._rs_height,
             self._rs_fps,
             # serial="236422074588",
-            serial="347622073775",
+            serial="140122071098",
             enable_color=True,
             enable_depth=True,
         )
+        self.realsense.start()
 
         # Distance from optical center to the frustum image plane (matches pinhole FOV).
         self._cam_image_depth = 0.4
 
-        self.visualizer = ViserVisualizer()
         self.ground_plane_estimator = GroundPlaneEstimator()
 
-        self.point_tracker_remote: PointTrackerRemote | None = None
-        on_frame = None
-        if point_tracker_port > 0:
-            self.point_tracker_remote = PointTrackerRemote(
-                server_endpoint=track_server_endpoint,
-                realsense_device=self._realsense,
-                use_internal_frame_loop=False,
-            )
+        # self.point_tracker_remote: PointTrackerRemote | None = None
+        # if point_tracker_port > 0:
+        #     self.point_tracker_remote = PointTrackerRemote(
+        #         server_endpoint=track_server_endpoint,
+        #         realsense_device=self.realsense,
+        #         use_internal_frame_loop=False,
+        #     )
 
         self.robot_model = RobotModelWrapper("robot_model/g1_29dof_rev_1_0.xml")
-        self.robot_model_handle = self.visualizer.add_robot(self.robot_model)
         self._qpos = np.zeros(self.robot_model.mj_model.nq, dtype=np.float64)
         self._qpos[3] = 1.0
         self.robot_model.update(self._qpos)
-        self.robot_model_handle.update()
-
-        self._camera_handle = self.visualizer.add_camera(
-            "/realsense/color",
-            self._realsense,
-            (self._rs_height, self._rs_width, 3),
-            frustum_depth=self._cam_image_depth,
-            robot_model=self.robot_model,
-            on_frame=on_frame,
-        )
 
         self._initial_odom = threading.Event()
         self._initial_lowstate = threading.Event()
-
-        self._camera_stop = threading.Event()
-        self._camera_handle.start_stream(self._camera_stop)
 
         self.lowstate_subscriber = ChannelSubscriber("rt/lowstate", LowState_)
         self.lowstate_subscriber.Init(self.LowStateHandler, 1)
@@ -96,35 +84,62 @@ class Manager:
         self.odom_subscriber = ChannelSubscriber("rt/odommodestate", SportModeState_)
         self.odom_subscriber.Init(self.SportModeStateHandler, 1)
 
+        self.point_tracker_remote: PointTrackerRemote | None = None
+        if point_tracker_port > 0:
+            self.point_tracker_remote = PointTrackerRemote(
+                server_endpoint=track_server_endpoint,
+                realsense_device=self.realsense,
+                use_internal_frame_loop=False,
+            )
+        self.setup_visualization()
+        if point_tracker_port > 0 and self.point_tracker_remote is not None:
+            port = point_tracker_port
+            tracker = self.point_tracker_remote
+
+            def _serve_gradio() -> None:
+                demo = tracker.build_ui()
+                demo.queue()
+                demo.launch(
+                    server_name="0.0.0.0",
+                    server_port=port,
+                    share=False,
+                )
+
+            threading.Thread(
+                target=_serve_gradio,
+                daemon=True,
+                name="gradio-point-tracker",
+            ).start()
+            logging.info(
+                "Point tracker Gradio UI — open http://127.0.0.1:%s "
+                "(Start remote tracker, then run the ZMQ track server at %r).",
+                port,
+                track_server_endpoint,
+            )
+
+    def setup_visualization(self) -> None:
+        self.visualizer = ViserVisualizer()
+        self.visualizer.add_robot(
+            self.robot_model,
+            body_names=["torso_link", ".*wrist_yaw_link", ".*ankle_roll_link"],
+        )
+        self._camera_handle = self.visualizer.add_camera(
+            "/realsense/color",
+            self.realsense,
+            (self._rs_height, self._rs_width, 3),
+            frustum_depth=self._cam_image_depth,
+            robot_model=self.robot_model,
+        )
         if self._wait_for_initial_pose(self._initial_pose_timeout_s):
             self.ground_plane_estimator.fit_and_visualize(
                 scene=self.visualizer.server.scene,
-                realsense=self._realsense,
-                K=self._realsense.K,
+                realsense=self.realsense,
+                K=self.realsense.K,
                 robot_model=self.robot_model,
                 image_width=self._rs_width,
                 image_height=self._rs_height,
             )
-
-        # if point_tracker_port > 0 and self.point_tracker_remote is not None:
-        #     _tracker = self.point_tracker_remote
-
-        #     def _run_point_tracker_ui() -> None:
-        #         demo = _tracker.build_ui()
-        #         demo.queue()
-        #         demo.launch(
-        #             server_name="0.0.0.0",
-        #             server_port=point_tracker_port,
-        #             share=False,
-        #         )
-
-        #     threading.Thread(target=_run_point_tracker_ui, daemon=True).start()
-        #     print(
-        #         "Point tracker UI (Gradio): open "
-        #         f"http://127.0.0.1:{point_tracker_port} — click “Start remote tracker”, "
-        #         "then capture / query / submit. Run the Track-On ZMQ server on "
-        #         f"{track_server_endpoint!r}."
-        #     )
+        self.visualizer.run_async(freq=20)
 
     def _forward_point_tracker_frame(
         self, rgb: np.ndarray, depth: np.ndarray, capture_ms: float
@@ -137,9 +152,8 @@ class Manager:
     def _wait_for_initial_pose(self, timeout_s: float) -> bool:
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
-            if self._initial_odom.is_set() and self._initial_lowstate.is_set():
+            if self._initial_odom.is_set() and self._initial_lowstate.is_set() and self.realsense.frame_ready.is_set():
                 self.robot_model.update(self._qpos)
-                self.robot_model_handle.update()
                 print(
                     "Manager: initial odometry and lowstate received; "
                     "synced robot model for ground plane."
@@ -175,23 +189,26 @@ class Manager:
         try:
             for step in itertools.count():
                 self.robot_model.update(self._qpos)
-                self._realsense.read_aligned_rgb_depth()
-                self.visualizer.update()
-                time.sleep(0.02)
-
+                t_cap = time.perf_counter()
+                rgb, depth = self.realsense.read_aligned_rgb_depth(timeout_s=0.25)
+                capture_ms = (time.perf_counter() - t_cap) * 1000.0
+                self._forward_point_tracker_frame(rgb, depth, capture_ms)
+                # if self.point_tracker_remote is not None:
+                #     print(
+                #         f"Capture: {capture_ms:.1f} ms, Point tracker: "
+                #         f"{self.point_tracker_remote.stats_message}"
+                #     )
                 if step % 50 == 0:
-                    print(f"LowStateHandler freq: {self.LowStateHandler.freq:.1f} Hz")
-                    print(
-                        f"SportModeStateHandler freq: {self.SportModeStateHandler.freq:.1f} Hz"
-                    )
+                    msg = f"LowStateHandler freq: {self.LowStateHandler.freq:.1f} Hz, SportModeStateHandler freq: {self.SportModeStateHandler.freq:.1f} Hz"
+                    logging.info(msg)
         except KeyboardInterrupt:
             pass
         finally:
-            self._camera_stop.set()
-            self.visualizer.join_camera_streams(timeout=2.0)
             if self.point_tracker_remote is not None:
                 self.point_tracker_remote.stop()
-            self._realsense.stop()
+            self.visualizer.stop_async()
+            print("Stopping RealSense...")
+            self.realsense.stop()
 
 
 def _parse_args() -> argparse.Namespace:
