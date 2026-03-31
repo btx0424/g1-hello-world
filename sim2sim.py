@@ -1,5 +1,12 @@
 from __future__ import annotations
 
+import os
+
+# Renderer + launch_passive both default to GLX; mixed GLX contexts often fail with
+# BadAccess on X_GLXMakeCurrent. EGL for MuJoCo's GL lets the viewer use X while
+# offscreen renders stay on EGL. Override with MUJOCO_GL if needed.
+os.environ.setdefault("MUJOCO_GL", "egl")
+
 import argparse
 import math
 import threading
@@ -11,7 +18,7 @@ import mujoco
 import mujoco.viewer
 import numpy as np
 
-from g1_hello_world.cameras import SimulatedCameraDevice
+from g1_hello_world.cameras import MujocoCameraStreamer
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelPublisher
 from unitree_sdk2py.idl.default import (
     unitree_go_msg_dds__SportModeState_,
@@ -159,6 +166,8 @@ class Sim2Sim:
         camera_width: int = 640,
         camera_height: int = 480,
         camera_fps: int = 30,
+        head_camera_endpoint: str = "tcp://127.0.0.1:6001",
+        wrist_camera_endpoint: str = "tcp://127.0.0.1:6002",
     ) -> None:
         self._xml_path = Path(xml_path)
         self._sim_dt = float(sim_dt)
@@ -179,21 +188,26 @@ class Sim2Sim:
         self.lowstate_publisher.Init()
         self.odom_publisher = ChannelPublisher("rt/odommodestate", SportModeState_)
         self.odom_publisher.Init()
-        self.head_camera = SimulatedCameraDevice(
+        self.head_camera = MujocoCameraStreamer(
             self,
             camera_name="sim_head_camera",
+            endpoint=head_camera_endpoint,
             width=camera_width,
             height=camera_height,
             fps=camera_fps,
         )
-        self.wrist_camera = SimulatedCameraDevice(
+        self.wrist_camera = MujocoCameraStreamer(
             self,
             camera_name="sim_wrist_camera",
+            endpoint=wrist_camera_endpoint,
             width=camera_width,
             height=camera_height,
             fps=camera_fps,
         )
 
+        self._camera_fps = int(camera_fps)
+        self._camera_stop = threading.Event()
+        self._camera_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._viewer = None
@@ -238,9 +252,7 @@ class Sim2Sim:
                 continue
 
             with self.lock:
-                mujoco.mj_forward(self.model, self.data)
-                if self._viewer is not None:
-                    self._viewer.sync()
+                mujoco.mj_step(self.model, self.data)
             next_step_t += self._sim_dt
 
             if now >= next_lowstate_t:
@@ -251,13 +263,28 @@ class Sim2Sim:
                 self._publish_odom()
                 next_odom_t += self._odom_period
 
+    def _camera_loop(self) -> None:
+        period = 1.0 / float(max(1, self._camera_fps))
+        while not self._camera_stop.is_set():
+            t0 = time.monotonic()
+            self.head_camera.render_and_publish()
+            self.wrist_camera.render_and_publish()
+            slack = period - (time.monotonic() - t0)
+            if slack > 0.0:
+                time.sleep(slack)
+
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
             return
         if self._viewer is None:
             self._viewer = mujoco.viewer.launch_passive(self.model, self.data)
-        self.head_camera.start()
-        self.wrist_camera.start()
+        self._camera_stop.clear()
+        self._camera_thread = threading.Thread(
+            target=self._camera_loop,
+            name="sim2sim-cameras",
+            daemon=True,
+        )
+        self._camera_thread.start()
         self._stop_event.clear()
         self._thread = threading.Thread(
             target=self._run,
@@ -266,13 +293,24 @@ class Sim2Sim:
         )
         self._thread.start()
 
+    def sync_viewer(self) -> None:
+        """Call from the thread that owns the GLFW/GLX context (the main thread)."""
+        if self._viewer is None:
+            return
+        with self.lock:
+            self._viewer.sync()
+
     def stop(self) -> None:
         self._stop_event.set()
         if self._thread is not None and self._thread.is_alive():
             self._thread.join(timeout=2.0)
         self._thread = None
-        self.head_camera.stop()
-        self.wrist_camera.stop()
+        self._camera_stop.set()
+        if self._camera_thread is not None and self._camera_thread.is_alive():
+            self._camera_thread.join(timeout=2.0)
+        self._camera_thread = None
+        self.head_camera.close()
+        self.wrist_camera.close()
         if self._viewer is not None:
             self._viewer.close()
         self._viewer = None
@@ -281,18 +319,25 @@ class Sim2Sim:
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="MuJoCo DDS emulator for g1-hello-world")
     parser.add_argument("--xml", default="robot_model/g1_29dof_rev_1_0.xml", help="Base robot XML")
+    parser.add_argument("--head-camera-endpoint", default="tcp://127.0.0.1:6001")
+    parser.add_argument("--wrist-camera-endpoint", default="tcp://127.0.0.1:6002")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = _parse_args()
     ChannelFactoryInitialize(0, "lo")
-    sim = Sim2Sim(xml_path=args.xml)
+    sim = Sim2Sim(
+        xml_path=args.xml,
+        head_camera_endpoint=args.head_camera_endpoint,
+        wrist_camera_endpoint=args.wrist_camera_endpoint,
+    )
     sim.start()
     print("sim2sim running. Publishing rt/lowstate and rt/odommodestate.")
     try:
         while True:
-            time.sleep(1.0)
+            sim.sync_viewer()
+            time.sleep(1.0 / 60.0)
     except KeyboardInterrupt:
         pass
     finally:

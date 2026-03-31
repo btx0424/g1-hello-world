@@ -1,2 +1,2 @@
-from .mujoco_device import SimulatedCameraDevice
+from .mujoco_device import MujocoCameraStreamer, ZmqSimCameraDevice
 from .realsense_device import RealSenseDeviceManager, RealSenseDeviceInfo

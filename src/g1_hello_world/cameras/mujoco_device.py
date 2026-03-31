@@ -3,19 +3,22 @@ from __future__ import annotations
 import math
 import threading
 import time
+from typing import Any
 
 import mujoco
 import numpy as np
+import zmq
 
 
-class SimulatedCameraDevice:
-    """MuJoCo-rendered RGB-D camera with the same surface API as RealSenseDeviceManager."""
+class MujocoCameraStreamer:
+    """Render RGB-D from a MuJoCo camera and publish frames over ZMQ."""
 
     def __init__(
         self,
-        sim: "Sim2Sim",
+        sim: Any,
         *,
         camera_name: str,
+        endpoint: str,
         width: int,
         height: int,
         fps: int,
@@ -23,6 +26,7 @@ class SimulatedCameraDevice:
     ) -> None:
         self._sim = sim
         self._camera_name = camera_name
+        self._endpoint = endpoint
         self._width = int(width)
         self._height = int(height)
         self._fps = int(fps)
@@ -37,15 +41,89 @@ class SimulatedCameraDevice:
             dtype=np.float64,
         )
 
+        self._context = zmq.Context.instance()
+        self._socket = self._context.socket(zmq.PUB)
+        self._socket.setsockopt(zmq.SNDHWM, 1)
+        self._socket.bind(self._endpoint)
+
+        # Created lazily on the rendering thread: EGL contexts are thread-affine; constructing
+        # Renderer on the main thread and rendering from another thread triggers EGL_BAD_ACCESS
+        # on many NVIDIA drivers. Multiple Renderers must also be driven from one thread with EGL.
+        self._renderer: mujoco.Renderer | None = None
+
+    def _ensure_renderer(self) -> mujoco.Renderer:
+        if self._renderer is None:
+            self._renderer = mujoco.Renderer(
+                self._sim.model, height=self._height, width=self._width
+            )
+        return self._renderer
+
+    def _render_frame(self) -> tuple[np.ndarray, np.ndarray]:
+        renderer = self._ensure_renderer()
+        with self._sim.lock:
+            renderer.disable_depth_rendering()
+            renderer.update_scene(self._sim.data, camera=self._camera_name)
+            rgb = np.ascontiguousarray(renderer.render())
+            renderer.enable_depth_rendering()
+            renderer.update_scene(self._sim.data, camera=self._camera_name)
+            depth_m = np.asarray(renderer.render(), dtype=np.float32)
+            renderer.disable_depth_rendering()
+        depth_raw = np.where(
+            np.isfinite(depth_m) & (depth_m > 0.0),
+            np.clip(np.rint(depth_m / self._depth_scale), 0.0, 65535.0),
+            0.0,
+        ).astype(np.uint16)
+        return rgb, depth_raw
+
+    def render_and_publish(self) -> None:
+        """Render one RGB-D pair and publish on ZMQ. Must be called from a single dedicated thread."""
+        rgb, depth = self._render_frame()
+        self._socket.send_pyobj(
+            {
+                "rgb": rgb,
+                "depth": depth,
+                "K": self._K,
+                "depth_scale": self._depth_scale,
+                "fov_y": self._fovy,
+                "aspect": float(self._width) / float(self._height),
+                "width": self._width,
+                "height": self._height,
+                "fps": self._fps,
+            }
+        )
+
+    def close(self) -> None:
+        if self._renderer is not None:
+            self._renderer.close()
+            self._renderer = None
+        self._socket.close(linger=0)
+
+
+class ZmqSimCameraDevice:
+    """Receive RGB-D frames from a remote MuJoCo renderer and expose the camera-device API."""
+
+    def __init__(self, endpoint: str) -> None:
+        self._endpoint = endpoint
+        self._context = zmq.Context.instance()
+        self._socket = self._context.socket(zmq.SUB)
+        self._socket.setsockopt(zmq.RCVHWM, 1)
+        self._socket.setsockopt(zmq.SUBSCRIBE, b"")
+        self._socket.connect(self._endpoint)
+
+        self._K = np.eye(3, dtype=np.float64)
+        self._depth_scale = 0.001
+        self._fov_y = math.radians(58.0)
+        self._aspect = 4.0 / 3.0
+        self._width = 640
+        self._height = 480
+        self._fps = 30
+
         self.rgb = np.zeros((self._height, self._width, 3), dtype=np.uint8)
         self.depth = np.zeros((self._height, self._width), dtype=np.uint16)
         self.frame_ready = threading.Event()
         self._frame_lock = threading.Lock()
-        self._stream_stop = threading.Event()
-        self._stream_thread: threading.Thread | None = None
-        self._renderer: mujoco.Renderer | None = mujoco.Renderer(
-            sim.model, height=self._height, width=self._width
-        )
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
 
     @property
     def depth_scale(self) -> float:
@@ -69,75 +147,53 @@ class SimulatedCameraDevice:
 
     @property
     def fov_y(self) -> float:
-        return self._fovy
+        return self._fov_y
 
     @property
     def aspect(self) -> float:
-        return float(self._width) / float(self._height)
+        return self._aspect
 
-    def _read_frames(self) -> tuple[np.ndarray, np.ndarray]:
-        with self._sim.lock:
-            if self._renderer is None:
-                raise RuntimeError(f"renderer for {self._camera_name!r} is closed")
-            self._renderer.disable_depth_rendering()
-            self._renderer.update_scene(self._sim.data, camera=self._camera_name)
-            rgb = np.ascontiguousarray(self._renderer.render())
-            self._renderer.enable_depth_rendering()
-            self._renderer.update_scene(self._sim.data, camera=self._camera_name)
-            depth_m = np.asarray(self._renderer.render(), dtype=np.float32)
-            self._renderer.disable_depth_rendering()
-
-        depth_raw = np.where(
-            np.isfinite(depth_m) & (depth_m > 0.0),
-            np.clip(np.rint(depth_m / self._depth_scale), 0.0, 65535.0),
-            0.0,
-        ).astype(np.uint16)
-        with self._frame_lock:
-            self.rgb = rgb
-            self.depth = depth_raw
-        return rgb, depth_raw
-
-    def _stream_loop(self) -> None:
-        period = 1.0 / float(max(1, self._fps))
-        while not self._stream_stop.is_set():
-            t0 = time.monotonic()
+    def _recv_loop(self) -> None:
+        while not self._stop_event.is_set():
             try:
-                self._read_frames()
+                payload = self._socket.recv_pyobj(flags=zmq.NOBLOCK)
+            except zmq.Again:
+                time.sleep(0.002)
+                continue
+            with self._frame_lock:
+                self.rgb = np.ascontiguousarray(payload["rgb"], dtype=np.uint8)
+                self.depth = np.ascontiguousarray(payload["depth"], dtype=np.uint16)
+                self._K = np.asarray(payload["K"], dtype=np.float64)
+                self._depth_scale = float(payload["depth_scale"])
+                self._fov_y = float(payload["fov_y"])
+                self._aspect = float(payload["aspect"])
+                self._width = int(payload["width"])
+                self._height = int(payload["height"])
+                self._fps = int(payload["fps"])
                 self.frame_ready.set()
-            except Exception:
-                break
-            slack = period - (time.monotonic() - t0)
-            if slack > 0.0:
-                time.sleep(slack)
 
     def start(self) -> None:
-        if self._stream_thread is not None and self._stream_thread.is_alive():
+        if self._thread is not None and self._thread.is_alive():
             return
-        if self._renderer is None:
-            self._renderer = mujoco.Renderer(
-                self._sim.model, height=self._height, width=self._width
-            )
-        self._stream_stop.clear()
-        self._stream_thread = threading.Thread(
-            target=self._stream_loop,
-            name=f"sim-camera-{self._camera_name}",
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._recv_loop,
+            name="sim-camera-recv",
             daemon=True,
         )
-        self._stream_thread.start()
+        self._thread.start()
 
     def stop(self) -> None:
-        self._stream_stop.set()
-        if self._stream_thread is not None and self._stream_thread.is_alive():
-            self._stream_thread.join(timeout=2.0)
-        self._stream_thread = None
-        if self._renderer is not None:
-            self._renderer.close()
-        self._renderer = None
+        self._stop_event.set()
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+        self._thread = None
+        self._socket.close(linger=0)
 
     def read_aligned_rgb_depth(self, *, timeout_s: float = 10.0) -> tuple[np.ndarray, np.ndarray]:
         if not self.frame_ready.wait(timeout_s):
             raise RuntimeError(
-                f"Timed out waiting for simulated camera frame {self._camera_name!r}."
+                f"Timed out waiting for simulated camera frame from {self._endpoint!r}."
             )
         with self._frame_lock:
             return self.rgb.copy(), self.depth.copy()
