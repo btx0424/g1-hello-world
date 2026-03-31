@@ -18,13 +18,19 @@ from unitree_sdk2py.core.channel import ChannelSubscriber, ChannelFactoryInitial
 from unitree_sdk2py.idl.unitree_go.msg.dds_ import SportModeState_
 from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_
 
-from g1_hello_world.constants import R_SITE_FROM_OPENCV
+from g1_hello_world.constants import (
+    R_SITE_FROM_OPENCV,
+    T_LEFT_WRIST_LINK_END_TO_RGB_PLACEHOLDER,
+    T_LEFT_WRIST_YAW_TO_LINK_END,
+)
 from g1_hello_world.realsense_device import RealSenseDeviceManager
 from g1_hello_world.robot_model import RobotModelWrapper
 from g1_hello_world.timing import timer_decorator
 from g1_hello_world.visualization import ViserVisualizer
 from g1_hello_world.estimators import GroundPlaneEstimator, PointTrackerRemote
 
+HEAD_SERIAL = "347622073775"
+WRIST_SERIAL = "236422074588"
 
 class Manager:
     def __init__(
@@ -47,22 +53,39 @@ class Manager:
             print(f"Device found: {info.name} (serial={info.serial})")
 
         self._rs_width, self._rs_height, self._rs_fps = 640, 480, 30
-        self.realsense = RealSenseDeviceManager(
-            self._rs_width,
-            self._rs_height,
-            self._rs_fps,
-            # serial="236422074588",
-            # serial="140122071098",
-            serial="347622073775",
-            enable_color=True,
-            enable_depth=True,
-        )
-        self.realsense.start()
+        try:
+            self.realsense_head = RealSenseDeviceManager(
+                self._rs_width,
+                self._rs_height,
+                self._rs_fps,
+                serial=HEAD_SERIAL,
+                enable_color=True,
+                enable_depth=True,
+            )
+            self.realsense_head.start()
+            self.ground_plane_estimator = GroundPlaneEstimator()
+        except Exception as e:
+            print(f"Error starting realsense_head: {e}")
+            self.realsense_head = None
+            self.ground_plane_estimator = None
+        
+        try:
+            self.realsense_wrist = RealSenseDeviceManager(
+                self._rs_width,
+                self._rs_height,
+                self._rs_fps,
+                serial=WRIST_SERIAL,
+                enable_color=True,
+                enable_depth=True,
+            )
+            self.realsense_wrist.start()
+        except Exception as e:
+            print(f"Error starting realsense_wrist: {e}")
+            self.realsense_wrist = None
 
         # Distance from optical center to the frustum image plane (matches pinhole FOV).
         self._cam_image_depth = 0.4
 
-        self.ground_plane_estimator = GroundPlaneEstimator()
 
         # self.point_tracker_remote: PointTrackerRemote | None = None
         # if point_tracker_port > 0:
@@ -87,10 +110,10 @@ class Manager:
         self.odom_subscriber.Init(self.SportModeStateHandler, 1)
 
         self.point_tracker_remote: PointTrackerRemote | None = None
-        if point_tracker_port > 0:
+        if point_tracker_port > 0 and self.realsense_wrist is not None:
             self.point_tracker_remote = PointTrackerRemote(
                 server_endpoint=track_server_endpoint,
-                realsense_device=self.realsense,
+                realsense_device=self.realsense_wrist,
                 use_internal_frame_loop=False,
             )
         self.setup_visualization()
@@ -125,22 +148,44 @@ class Manager:
             self.robot_model,
             body_names=["torso_link", ".*wrist_yaw_link", ".*ankle_roll_link"],
         )
-        self._camera_handle = self.visualizer.add_camera(
-            "/realsense/color",
-            self.realsense,
-            (self._rs_height, self._rs_width, 3),
-            frustum_depth=self._cam_image_depth,
-            robot_model=self.robot_model,
+        if self.realsense_head is not None:
+            self.visualizer.add_camera(
+                "/realsense_head/color",
+                self.realsense_head,
+                (self._rs_height, self._rs_width, 3),
+                frustum_depth=self._cam_image_depth,
+                robot_model=self.robot_model,
+                site_name="d435_head",
+            )
+        if self.realsense_wrist is not None:
+            self.visualizer.add_camera(
+                "/realsense_wrist/color",
+                self.realsense_wrist,
+                (self._rs_height, self._rs_width, 3),
+                frustum_depth=self._cam_image_depth,
+                robot_model=self.robot_model,
+                site_name="d435_wrist",
+            )
+        self.visualizer.add_body_frame(
+            "/frames/left_wrist_rgb_mount",
+            self.robot_model,
+            body_name="left_wrist_yaw_link",
+            body_from_frame=(
+                T_LEFT_WRIST_YAW_TO_LINK_END
+                @ T_LEFT_WRIST_LINK_END_TO_RGB_PLACEHOLDER
+            ),
         )
         if self._wait_for_initial_pose(self._initial_pose_timeout_s):
-            self.ground_plane_estimator.fit_and_visualize(
-                scene=self.visualizer.server.scene,
-                realsense=self.realsense,
-                K=self.realsense.K,
-                robot_model=self.robot_model,
-                image_width=self._rs_width,
-                image_height=self._rs_height,
-            )
+            if self.ground_plane_estimator is not None:
+                self.ground_plane_estimator.fit_and_visualize(
+                    scene=self.visualizer.server.scene,
+                    realsense=self.realsense_head,
+                    K=self.realsense_head.K,
+                    robot_model=self.robot_model,
+                    image_width=self._rs_width,
+                    image_height=self._rs_height,
+                    site_name="d435_head",
+                )
         self.visualizer.run_async(freq=20)
 
     def _forward_point_tracker_frame(
@@ -162,7 +207,7 @@ class Manager:
             self.visualizer.set_tracker_points(None)
             return
 
-        pos_link, world_from_link = self.robot_model.get_site_frame("d435")
+        pos_link, world_from_link = self.robot_model.get_site_frame("d435_wrist")
         world_from_cv = world_from_link @ R_SITE_FROM_OPENCV
         tracked_points_world = (
             tracked_points_camera @ world_from_cv.T
@@ -183,7 +228,7 @@ class Manager:
     def _wait_for_initial_pose(self, timeout_s: float) -> bool:
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
-            if self._initial_odom.is_set() and self._initial_lowstate.is_set() and self.realsense.frame_ready.is_set():
+            if self._initial_odom.is_set() and self._initial_lowstate.is_set():
                 self.robot_model.update(self._qpos)
                 print(
                     "Manager: initial odometry and lowstate received; "
@@ -221,7 +266,7 @@ class Manager:
             for step in itertools.count():
                 self.robot_model.update(self._qpos)
                 t_cap = time.perf_counter()
-                rgb, depth = self.realsense.read_aligned_rgb_depth(timeout_s=0.25)
+                rgb, depth = self.realsense_wrist.read_aligned_rgb_depth(timeout_s=0.25)
                 capture_ms = (time.perf_counter() - t_cap) * 1000.0
                 self._forward_point_tracker_frame(rgb, depth, capture_ms)
                 self._update_point_tracker_visualization()
@@ -239,8 +284,12 @@ class Manager:
             if self.point_tracker_remote is not None:
                 self.point_tracker_remote.stop()
             self.visualizer.stop_async()
-            print("Stopping RealSense...")
-            self.realsense.stop()
+            if self.realsense_head is not None:
+                print("Stopping RealSense head...")
+                self.realsense_head.stop()
+            if self.realsense_wrist is not None:
+                print("Stopping RealSense wrist...")
+                self.realsense_wrist.stop()
 
 
 def _parse_args() -> argparse.Namespace:

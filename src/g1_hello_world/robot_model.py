@@ -69,6 +69,7 @@ class RobotModelWrapper:
             self.body_meshes[body_name] = body_mesh
 
         self._site_ids: dict[str, int] = {}
+        self._body_ids: dict[str, int] = {}
 
     def update(self, qpos: np.ndarray) -> None:
         self.mj_data.qpos[:] = qpos
@@ -93,6 +94,17 @@ class RobotModelWrapper:
         )
         return pos, rotation
 
+    def get_body_frame(self, body_name: str) -> tuple[np.ndarray, np.ndarray]:
+        """Position (3,) and world-from-body rotation (3,3), same convention as `xmat`."""
+        body_id = self._get_body_id(body_name)
+        pos = np.asarray(self.mj_data.xpos[body_id], dtype=np.float64).copy()
+        rotation = (
+            np.asarray(self.mj_data.xmat[body_id], dtype=np.float64)
+            .reshape(3, 3)
+            .copy()
+        )
+        return pos, rotation
+
     def _get_site_id(self, site_name: str) -> int:
         if site_name not in self._site_ids:
             site_id = mujoco.mj_name2id(
@@ -102,4 +114,14 @@ class RobotModelWrapper:
                 raise ValueError(f"unknown site name: {site_name!r}")
             self._site_ids[site_name] = site_id
         return self._site_ids[site_name]
+
+    def _get_body_id(self, body_name: str) -> int:
+        if body_name not in self._body_ids:
+            body_id = mujoco.mj_name2id(
+                self.mj_model, mujoco.mjtObj.mjOBJ_BODY, body_name
+            )
+            if body_id < 0:
+                raise ValueError(f"unknown body name: {body_name!r}")
+            self._body_ids[body_name] = body_id
+        return self._body_ids[body_name]
 

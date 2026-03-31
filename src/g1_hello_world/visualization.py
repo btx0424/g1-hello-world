@@ -111,11 +111,53 @@ class ViserCameraHandle:
             self.frustum.wxyz = wxyz
 
 
+class ViserBodyFrameHandle:
+    def __init__(
+        self,
+        scene: viser.SceneApi,
+        name: str,
+        robot_model: RobotModelWrapper,
+        *,
+        body_name: str,
+        body_from_frame: np.ndarray | None = None,
+        axes_length: float = 0.12,
+        axes_radius: float = 0.006,
+        origin_radius: float | None = 0.012,
+        origin_color: tuple[int, int, int] = (255, 140, 0),
+    ) -> None:
+        self._robot_model = robot_model
+        self._body_name = body_name
+        self._body_from_frame = (
+            np.eye(4, dtype=np.float64)
+            if body_from_frame is None
+            else np.asarray(body_from_frame, dtype=np.float64)
+        )
+        if self._body_from_frame.shape != (4, 4):
+            raise ValueError("body_from_frame must have shape (4, 4)")
+        self.frame = scene.add_frame(
+            name,
+            axes_length=axes_length,
+            axes_radius=axes_radius,
+            origin_radius=origin_radius,
+            origin_color=origin_color,
+        )
+
+    def update(self) -> None:
+        body_pos, world_from_body = self._robot_model.get_body_frame(self._body_name)
+        world_from_frame = world_from_body @ self._body_from_frame[:3, :3]
+        frame_pos = body_pos + world_from_body @ self._body_from_frame[:3, 3]
+        wxyz = np.zeros(4, dtype=np.float64)
+        mujoco.mju_mat2Quat(wxyz, world_from_frame.flatten(order="C"))
+        self.frame.position = frame_pos
+        self.frame.wxyz = wxyz
+
+
 class ViserVisualizer:
     def __init__(self) -> None:
         self.server = viser.ViserServer()
         self.robot_model_handles: list[ViserRobotModelHandle] = []
         self.camera_handles: list[ViserCameraHandle] = []
+        self.body_frame_handles: list[ViserBodyFrameHandle] = []
         self._tracker_points_handle: viser.PointCloudHandle | None = None
         self._async_stop = threading.Event()
         self._async_thread: threading.Thread | None = None
@@ -124,6 +166,8 @@ class ViserVisualizer:
         for handle in self.robot_model_handles:
             handle.update()
         for handle in self.camera_handles:
+            handle.update()
+        for handle in self.body_frame_handles:
             handle.update()
 
     def add_camera(
@@ -155,6 +199,32 @@ class ViserVisualizer:
     def add_robot(self, robot_model: RobotModelWrapper, body_names: str | list[str] = ".*") -> ViserRobotModelHandle:
         handle = ViserRobotModelHandle(self.server.scene, robot_model, body_names)
         self.robot_model_handles.append(handle)
+        return handle
+
+    def add_body_frame(
+        self,
+        name: str,
+        robot_model: RobotModelWrapper,
+        *,
+        body_name: str,
+        body_from_frame: np.ndarray | None = None,
+        axes_length: float = 0.12,
+        axes_radius: float = 0.006,
+        origin_radius: float | None = 0.012,
+        origin_color: tuple[int, int, int] = (255, 140, 0),
+    ) -> ViserBodyFrameHandle:
+        handle = ViserBodyFrameHandle(
+            self.server.scene,
+            name,
+            robot_model,
+            body_name=body_name,
+            body_from_frame=body_from_frame,
+            axes_length=axes_length,
+            axes_radius=axes_radius,
+            origin_radius=origin_radius,
+            origin_color=origin_color,
+        )
+        self.body_frame_handles.append(handle)
         return handle
 
     def set_tracker_points(
