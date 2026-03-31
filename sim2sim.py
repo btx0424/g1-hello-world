@@ -14,6 +14,7 @@ import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+import glfw
 import mujoco
 import mujoco.viewer
 import numpy as np
@@ -156,11 +157,13 @@ def _build_sim_xml(base_xml_path: Path) -> str:
 class Sim2Sim:
     """Minimal MuJoCo-to-DDS bridge for local app testing without hardware."""
 
+    default_damping: float = 0.2
+
     def __init__(
         self,
         *,
-        xml_path: str = "robot_model/g1_29dof_rev_1_0.xml",
-        sim_dt: float = 0.002,
+        xml_path: str = "robot_model/g1.xml",
+        sim_dt: float = 0.005,
         lowstate_hz: float = 500.0,
         odom_hz: float = 200.0,
         camera_width: int = 640,
@@ -176,13 +179,44 @@ class Sim2Sim:
         self.lock = threading.Lock()
 
         xml_text = _build_sim_xml(self._xml_path)
-        self.model = mujoco.MjModel.from_xml_string(xml_text)
+        spec = mujoco.MjSpec.from_string(xml_text)
+        for joint in spec.joints:
+            joint: mujoco.MjsJoint
+            joint.damping = 0.4
+            joint.frictionloss = 0.1
+        self.model: mujoco.MjModel = spec.compile()
         self.data = mujoco.MjData(self.model)
         self.model.opt.timestep = self._sim_dt
+
+        mujoco.mj_step(self.model, self.data)
 
         self._init_pose()
         with self.lock:
             mujoco.mj_forward(self.model, self.data)
+
+        assert self.model.nu == 29, "Only 29 hinge joints are supported"
+        self.kd = np.zeros(self.model.nu, dtype=np.float64)
+        self.kd.fill(self.default_damping)
+
+        self._motor_actuator_ids = np.arange(self.model.nu, dtype=np.int32)
+        self._actuator_joint_ids = np.array(
+            [int(self.model.actuator_trnid[i, 0]) for i in self._motor_actuator_ids],
+            dtype=np.int32,
+        )
+        self._actuator_dof_adr = np.array(
+            [int(self.model.jnt_dofadr[j]) for j in self._actuator_joint_ids],
+            dtype=np.int32,
+        )
+        self._tau_lim_lo = np.array(
+            [float(self.model.jnt_actfrcrange[j, 0]) for j in self._actuator_joint_ids],
+            dtype=np.float64,
+        )
+        self._tau_lim_hi = np.array(
+            [float(self.model.jnt_actfrcrange[j, 1]) for j in self._actuator_joint_ids],
+            dtype=np.float64,
+        )
+        self._motor_damping_event = threading.Event()
+        self._motor_damping_event.set()
 
         self.lowstate_publisher = ChannelPublisher("rt/lowstate", LowState_)
         self.lowstate_publisher.Init()
@@ -212,6 +246,25 @@ class Sim2Sim:
         self._thread: threading.Thread | None = None
         self._viewer = None
 
+    def _apply_motor_damping(self) -> None:
+        """Viscous damping via actuator control: ctrl = -b * qdot for all motor actuators."""
+        d = self.data
+        if not self._motor_damping_event.is_set():
+            d.ctrl[self._motor_actuator_ids] = 0.0
+            return
+        dq = d.qvel[self._actuator_dof_adr]
+        tau = self.kd * (0.0 - dq)
+        tau = np.clip(tau, self._tau_lim_lo, self._tau_lim_hi)
+        d.ctrl[self._motor_actuator_ids] = tau
+
+    def _viewer_key_callback(self, key: int) -> None:
+        if key == glfw.KEY_D:
+            if self._motor_damping_event.is_set():
+                self._motor_damping_event.clear()
+                print("Motor damping: OFF")
+            else:
+                self._motor_damping_event.set()
+                print(f"Motor damping: ON (b={self.kd:g} N·m·s/rad)")
     def _init_pose(self) -> None:
         self.data.qpos[:] = 0.0
         self.data.qvel[:] = 0.0
@@ -252,6 +305,7 @@ class Sim2Sim:
                 continue
 
             with self.lock:
+                self._apply_motor_damping()
                 mujoco.mj_step(self.model, self.data)
             next_step_t += self._sim_dt
 
@@ -277,7 +331,11 @@ class Sim2Sim:
         if self._thread is not None and self._thread.is_alive():
             return
         if self._viewer is None:
-            self._viewer = mujoco.viewer.launch_passive(self.model, self.data)
+            self._viewer = mujoco.viewer.launch_passive(
+                self.model,
+                self.data,
+                key_callback=self._viewer_key_callback,
+            )
         self._camera_stop.clear()
         self._camera_thread = threading.Thread(
             target=self._camera_loop,
@@ -318,7 +376,7 @@ class Sim2Sim:
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="MuJoCo DDS emulator for g1-hello-world")
-    parser.add_argument("--xml", default="robot_model/g1_29dof_rev_1_0.xml", help="Base robot XML")
+    parser.add_argument("--xml", default="robot_model/g1.xml", help="Base robot XML")
     parser.add_argument("--head-camera-endpoint", default="tcp://127.0.0.1:6001")
     parser.add_argument("--wrist-camera-endpoint", default="tcp://127.0.0.1:6002")
     return parser.parse_args()
@@ -333,7 +391,10 @@ if __name__ == "__main__":
         wrist_camera_endpoint=args.wrist_camera_endpoint,
     )
     sim.start()
-    print("sim2sim running. Publishing rt/lowstate and rt/odommodestate.")
+    print(
+        "sim2sim running. Publishing rt/lowstate and rt/odommodestate. "
+        "Motor joint damping is ON by default; press D in the viewer to toggle."
+    )
     try:
         while True:
             sim.sync_viewer()
