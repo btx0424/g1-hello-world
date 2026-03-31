@@ -112,14 +112,22 @@ class Manager:
             # ['left_shoulder_pitch_joint', 'left_shoulder_roll_joint', 'left_shoulder_yaw_joint', 'left_elbow_joint', 'left_wrist_roll_joint', 'left_wrist_pitch_joint', 'left_wrist_yaw_joint']
             self._arm_kp = 60.0
             self._arm_kd = 1.5
-            self._look_gain = 2.0
+            self._look_gain = 2.5
             self._look_dlam = 0.06
-            self._look_dq_max = 0.06
+            self._look_dq_max = 0.08
             # IK smoothing: scale DLS Δq, EMA filter, task error clamps (reduces jerk at 50 Hz).
-            self._ik_step_scale = 0.42
-            self._ik_dq_ema_beta = 0.28
-            self._omega_task_max = 0.38
+            self._ik_step_scale = 0.5
+            self._ik_dq_ema_beta = 0.4
+            self._omega_task_max = 0.45
             self._height_err_clip = 0.12
+            # Filter/predict the target in world space so tracking stays responsive during gait.
+            self._target_pos_ema_beta = 0.4
+            self._target_lead_s = 0.02
+            self._target_speed_clip = 2.5
+            self._target_pos_filt_w: np.ndarray | None = None
+            self._target_vel_filt_w = np.zeros(3, dtype=np.float64)
+            self._target_t_prev: float | None = None
+            self._task_ang_damping = 0.35
             # Floating-base quat from LowState is wxyz; MuJoCo uses it as body→world. If gaze heading
             # is mirrored / wrong, try True (conjugate quaternion before mju_quat2Mat).
             self._imu_quat_wxyz_conjugate = False
@@ -169,8 +177,8 @@ class Manager:
             self.point_tracker_remote = PointTrackerRemote(
                 server_endpoint=track_server_endpoint,
                 realsense_device=self.realsense_wrist,
-                use_internal_frame_loop=False,
             )
+            self.point_tracker_remote.start()
         if self._visualization:
             self.setup_visualization()
         else:
@@ -368,6 +376,27 @@ class Manager:
                 point_center = np.mean(points_world[valid], axis=0)
             else:
                 point_center = pos_cam + forward
+            t_now = time.perf_counter()
+            if self._target_pos_filt_w is None:
+                self._target_pos_filt_w = point_center.copy()
+                self._target_vel_filt_w.fill(0.0)
+                self._target_t_prev = t_now
+            else:
+                dt = max(1e-3, t_now - (self._target_t_prev or t_now))
+                pos_prev = self._target_pos_filt_w.copy()
+                beta = self._target_pos_ema_beta
+                self._target_pos_filt_w = (
+                    (1.0 - beta) * self._target_pos_filt_w + beta * point_center
+                )
+                vel_meas = (self._target_pos_filt_w - pos_prev) / dt
+                speed = np.linalg.norm(vel_meas)
+                if speed > self._target_speed_clip:
+                    vel_meas *= self._target_speed_clip / (speed + 1e-12)
+                self._target_vel_filt_w = (
+                    (1.0 - beta) * self._target_vel_filt_w + beta * vel_meas
+                )
+                self._target_t_prev = t_now
+            point_center = self._target_pos_filt_w + self._target_lead_s * self._target_vel_filt_w
             # Aim the wrist camera optical center at the tracked point, not the wrist-body origin.
             fwd_des = point_center - pos_cam
             n = np.linalg.norm(fwd_des)
@@ -413,9 +442,10 @@ class Manager:
         J_r = jacr[:, dof_cols]
         z_w = R_root[:, 2]
         J_h = (z_w @ jacp)[dof_cols].reshape(1, -1)
+        omega_wrist = J_r @ self.jvel[arm_sdk]
 
         e = np.empty(4, dtype=np.float64)
-        e[:3] = self._look_gain * omega
+        e[:3] = self._look_gain * omega - self._task_ang_damping * omega_wrist
         n_omega = float(np.linalg.norm(e[:3]))
         if n_omega > self._omega_task_max:
             e[:3] *= self._omega_task_max / (n_omega + 1e-12)
@@ -453,7 +483,6 @@ class Manager:
                 t0 = time.perf_counter()
                 points: np.ndarray | None = None
                 if self.point_tracker_remote is not None:
-                    self.point_tracker_remote.update()
                     points, visibility = (
                         self.point_tracker_remote.get_tracked_points_snapshot()
                     )
