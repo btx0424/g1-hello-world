@@ -73,7 +73,8 @@ class RobotModelWrapper:
 
     def update(self, qpos: np.ndarray) -> None:
         self.mj_data.qpos[:] = qpos
-        mujoco.mj_forward(self.mj_model, self.mj_data)
+        # mujoco.mj_forward(self.mj_model, self.mj_data)
+        mujoco.mj_fwdPosition(self.mj_model, self.mj_data)
 
     def get_site_pose(self, site_name: str) -> tuple[np.ndarray, np.ndarray]:
         """World pose of the site after the last `update()`: position (3,) and wxyz quaternion (4)."""

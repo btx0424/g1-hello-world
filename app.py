@@ -104,10 +104,10 @@ class Manager:
         self._initial_lowstate = threading.Event()
 
         self.lowstate_subscriber = ChannelSubscriber("rt/lowstate", LowState_)
-        self.lowstate_subscriber.Init(self.LowStateHandler, 1)
+        self.lowstate_subscriber.Init(self.LowStateHandler, 0)
 
         self.odom_subscriber = ChannelSubscriber("rt/odommodestate", SportModeState_)
-        self.odom_subscriber.Init(self.SportModeStateHandler, 1)
+        self.odom_subscriber.Init(self.SportModeStateHandler, 0)
 
         self.point_tracker_remote: PointTrackerRemote | None = None
         if point_tracker_port > 0 and self.realsense_wrist is not None:
@@ -188,14 +188,6 @@ class Manager:
                 )
         self.visualizer.run_async(freq=20)
 
-    def _forward_point_tracker_frame(
-        self, rgb: np.ndarray, depth: np.ndarray, capture_ms: float
-    ) -> None:
-        if self.point_tracker_remote is not None:
-            self.point_tracker_remote.on_aligned_frame(
-                rgb, depth, capture_ms=capture_ms
-            )
-
     def _update_point_tracker_visualization(self) -> None:
         if self.point_tracker_remote is None:
             return
@@ -264,20 +256,15 @@ class Manager:
     def run(self) -> None:
         try:
             for step in itertools.count():
+                t0 = time.perf_counter()
                 self.robot_model.update(self._qpos)
-                t_cap = time.perf_counter()
-                rgb, depth = self.realsense_wrist.read_aligned_rgb_depth(timeout_s=0.25)
-                capture_ms = (time.perf_counter() - t_cap) * 1000.0
-                self._forward_point_tracker_frame(rgb, depth, capture_ms)
+                if self.point_tracker_remote is not None:
+                    self.point_tracker_remote.update()
                 self._update_point_tracker_visualization()
-                # if self.point_tracker_remote is not None:
-                #     print(
-                #         f"Capture: {capture_ms:.1f} ms, Point tracker: "
-                #         f"{self.point_tracker_remote.stats_message}"
-                #     )
                 if step % 50 == 0:
                     msg = f"LowStateHandler freq: {self.LowStateHandler.freq:.1f} Hz, SportModeStateHandler freq: {self.SportModeStateHandler.freq:.1f} Hz"
-                    logging.info(msg)
+                    print(msg)
+                print(time.perf_counter() - t0)
         except KeyboardInterrupt:
             pass
         finally:

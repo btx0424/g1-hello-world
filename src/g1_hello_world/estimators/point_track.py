@@ -195,9 +195,6 @@ class PointTrackerRemote:
                         )
         return out
 
-    def _read_rgb_depth_aligned(self) -> tuple[np.ndarray, np.ndarray]:
-        return self._rs.read_aligned_rgb_depth(timeout_s=self._aligned_read_timeout_s)
-
     def _process_frame_rgb_depth(
         self,
         rgb: np.ndarray,
@@ -260,22 +257,11 @@ class PointTrackerRemote:
                 f"server_infer={server_infer_ms:.1f} ms | server_total={server_total_ms:.1f} ms | "
                 f"loop={total_ms:.1f} ms | fps={fps:.1f} | xyz={valid_xyz_count}"
             )
-
-    def on_aligned_frame(
-        self,
-        rgb: np.ndarray,
-        depth: np.ndarray,
-        *,
-        capture_ms: float = 0.0,
-    ) -> None:
-        """
-        Feed one color-aligned RGB + depth pair from the host app's camera loop.
-        No-op until :meth:`start` has been called (session live). Use when
-        ``use_internal_frame_loop=False``.
-        """
-        if not self._session_live:
-            return
+    
+    def update(self):
         t0 = time.perf_counter()
+        rgb, depth = self._rs.read_aligned_rgb_depth(timeout_s=0.25)
+        capture_ms = (time.perf_counter() - t0) * 1000.0
         self._process_frame_rgb_depth(
             np.ascontiguousarray(rgb, dtype=np.uint8),
             np.ascontiguousarray(depth, dtype=np.uint16),
