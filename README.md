@@ -19,16 +19,27 @@ Prototype viewer for a Unitree G1 robot model with MuJoCo, Viser, Unitree DDS st
 └── pyproject.toml
 ```
 
-## Run
+## Environment
+
+Use the **project-local** uv environment (`.venv` next to `pyproject.toml`):
 
 ```bash
-uv run python main.py --iface eth0
+cd g1-hello-world
+uv sync
 ```
 
-Or, after installation:
+## Run
+
+From **`g1-hello-world`** (so `uv` resolves this project and its `.venv`):
 
 ```bash
-uv run g1-hello-world --iface eth0
+uv run app.py --iface eth0
+```
+
+Or use the helper script (changes into this directory first, then `uv run app.py`):
+
+```bash
+./run.sh --iface eth0
 ```
 
 ## Why this structure

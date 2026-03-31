@@ -5,9 +5,11 @@ description = "Prototype viewer for Unitree G1 state, MuJoCo geometry, and RealS
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "linuxfd>=1.5",
     "mujoco>=3.6.0",
     "onnxruntime>=1.24.4",
     "onnxscript>=0.6.2",
+    "pin>=3.9.0",
     "pyzmq>=27.1.0",
     "rerun-sdk>=0.30.2",
     "viser>=1.0.24",

@@ -8,6 +8,7 @@ import trimesh
 from scipy.spatial.transform import Rotation as sRot
 
 from .constants import MJ_MESH
+from .utils.string import resolve_matching_names
 from collections import defaultdict
 
 
@@ -28,12 +29,14 @@ def geom_mesh_trimesh(model: mujoco.MjModel, gid: int) -> trimesh.Trimesh:
 
 class RobotModelWrapper:
     def __init__(self, xml_path: str | Path) -> None:
+        # Keep floating_base_joint: nq = 7 (free) + 29 hinges; nv = 6 + 29.
         self.mj_model = mujoco.MjModel.from_xml_path(str(xml_path))
         self.mj_data = mujoco.MjData(self.mj_model)
 
+        # Hinge names only, in XML / SDK order: joint_names[i] == MuJoCo joint id (i + 1).
         self.joint_names = [
             mujoco.mj_id2name(self.mj_model, mujoco.mjtObj.mjOBJ_JOINT, joint_id)
-            for joint_id in range(self.mj_model.njnt)
+            for joint_id in range(1, self.mj_model.njnt)
         ]
         self.body_adrs = list(range(1, self.mj_model.nbody)) # exclude world body
         self.body_names = [
@@ -71,10 +74,18 @@ class RobotModelWrapper:
         self._site_ids: dict[str, int] = {}
         self._body_ids: dict[str, int] = {}
 
-    def update(self, qpos: np.ndarray) -> None:
+    def find_bodies(self, body_name: str| list[str]):
+        return resolve_matching_names(body_name, self.body_names)
+    
+    def find_joints(self, joint_name: str| list[str]):
+        return resolve_matching_names(joint_name, self.joint_names)
+
+    def update(self, qpos: np.ndarray, jacobian: bool = False) -> None:
         self.mj_data.qpos[:] = qpos
-        # mujoco.mj_forward(self.mj_model, self.mj_data)
-        mujoco.mj_fwdPosition(self.mj_model, self.mj_data)
+        if jacobian:
+            mujoco.mj_forward(self.mj_model, self.mj_data)
+        else:
+            mujoco.mj_fwdPosition(self.mj_model, self.mj_data)
 
     def get_site_pose(self, site_name: str) -> tuple[np.ndarray, np.ndarray]:
         """World pose of the site after the last `update()`: position (3,) and wxyz quaternion (4)."""

@@ -5,6 +5,8 @@ import argparse
 import itertools
 import threading
 import time
+
+import mujoco
 import numpy as np
 import trimesh
 import logging
@@ -14,11 +16,13 @@ logging.basicConfig(level=logging.INFO)
 from unitree_sdk2py.comm.motion_switcher.motion_switcher_client import (
     MotionSwitcherClient,
 )
-from unitree_sdk2py.core.channel import ChannelSubscriber, ChannelFactoryInitialize
+from unitree_sdk2py.core.channel import ChannelSubscriber, ChannelPublisher, ChannelFactoryInitialize
 from unitree_sdk2py.idl.unitree_go.msg.dds_ import SportModeState_
-from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_
+from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_, LowCmd_
+from unitree_sdk2py.utils.crc import CRC
 
 from g1_hello_world.constants import (
+    G1JointIndex,
     R_SITE_FROM_OPENCV,
     T_LEFT_WRIST_LINK_END_TO_RGB_PLACEHOLDER,
     T_LEFT_WRIST_YAW_TO_LINK_END,
@@ -28,6 +32,7 @@ from g1_hello_world.robot_model import RobotModelWrapper
 from g1_hello_world.timing import timer_decorator
 from g1_hello_world.visualization import ViserVisualizer
 from g1_hello_world.estimators import GroundPlaneEstimator, PointTrackerRemote
+from g1_hello_world.utils.timerfd import Timer
 
 HEAD_SERIAL = "347622073775"
 WRIST_SERIAL = "236422074588"
@@ -35,11 +40,14 @@ WRIST_SERIAL = "236422074588"
 class Manager:
     def __init__(
         self,
+        visualization: bool = True,
+        arm_sdk: bool = True,
         *,
         initial_pose_timeout_s: float = 10.0,
         track_server_endpoint: str = "tcp://127.0.0.1:5555",
         point_tracker_port: int = 0,
     ) -> None:
+        self._visualization = visualization
         self._initial_pose_timeout_s = initial_pose_timeout_s
 
         self.msc = MotionSwitcherClient()
@@ -83,25 +91,72 @@ class Manager:
             print(f"Error starting realsense_wrist: {e}")
             self.realsense_wrist = None
 
-        # Distance from optical center to the frustum image plane (matches pinhole FOV).
-        self._cam_image_depth = 0.4
-
-
-        # self.point_tracker_remote: PointTrackerRemote | None = None
-        # if point_tracker_port > 0:
-        #     self.point_tracker_remote = PointTrackerRemote(
-        #         server_endpoint=track_server_endpoint,
-        #         realsense_device=self.realsense,
-        #         use_internal_frame_loop=False,
-        #     )
-
         self.robot_model = RobotModelWrapper("robot_model/g1_29dof_rev_1_0.xml")
         self._qpos = np.zeros(self.robot_model.mj_model.nq, dtype=np.float64)
-        self._qpos[3] = 1.0
+        self._qpos[3] = 1.0  # floating base quaternion w (identity), MuJoCo qpos[3:7] wxyz
         self.robot_model.update(self._qpos)
+        self.imu_rpy = np.zeros(3, dtype=np.float64)
 
         self._initial_odom = threading.Event()
         self._initial_lowstate = threading.Event()
+
+        if arm_sdk: 
+            from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowCmd_
+            self.arm_sdk_publisher = ChannelPublisher("rt/arm_sdk", LowCmd_)
+            self.arm_sdk_publisher.Init()
+            self.low_cmd = unitree_hg_msg_dds__LowCmd_()
+            self.crc = CRC()
+            self.arm_joint_indices, self.arm_joint_names = self.robot_model.find_joints(["left_(shoulder|elbow|wrist).*"])
+            # this should give us:
+            # [15, 16, 17, 18, 19, 20, 21]
+            # ['left_shoulder_pitch_joint', 'left_shoulder_roll_joint', 'left_shoulder_yaw_joint', 'left_elbow_joint', 'left_wrist_roll_joint', 'left_wrist_pitch_joint', 'left_wrist_yaw_joint']
+            self._arm_kp = 60.0
+            self._arm_kd = 1.5
+            self._look_gain = 2.0
+            self._look_dlam = 0.06
+            self._look_dq_max = 0.06
+            # IK smoothing: scale DLS Δq, EMA filter, task error clamps (reduces jerk at 50 Hz).
+            self._ik_step_scale = 0.42
+            self._ik_dq_ema_beta = 0.28
+            self._omega_task_max = 0.38
+            self._height_err_clip = 0.12
+            # Floating-base quat from LowState is wxyz; MuJoCo uses it as body→world. If gaze heading
+            # is mirrored / wrong, try True (conjugate quaternion before mju_quat2Mat).
+            self._imu_quat_wxyz_conjugate = False
+            # Unit direction in pelvis body frame treated as “forward” (XML / SDK pelvis +X).
+            self._pelvis_forward_body = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+            # Wrist body axis steered toward fwd_des (camera bore may differ from link +X).
+            self._wrist_look_axis_body = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+            # World “up” for horizontal projection of pelvis forward (same as flat ground normal).
+            self._world_horizontal_normal = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+            self._quat_mat9 = np.zeros(9, dtype=np.float64)
+            # Pelvis is the floating-base / root body; keep wrist origin at this z in pelvis frame.
+            self._wrist_height_in_root = 0.1
+            self._height_gain = 12.0
+            # World direction for link +Z (hardware frame): right = -world Y.
+            self._world_up = np.array([0.0, -1.0, 0.0], dtype=np.float64)
+            self._up_align_gain = 2.0
+            m = self.robot_model.mj_model
+            mj_jids = [i + 1 for i in self.arm_joint_indices]
+            self._arm_dof_cols = np.array(
+                [int(m.jnt_dofadr[j]) for j in mj_jids], dtype=np.int32
+            )
+            self._left_wrist_body_id = mujoco.mj_name2id(
+                m, mujoco.mjtObj.mjOBJ_BODY, "left_wrist_yaw_link"
+            )
+            self._jacp_buf = np.zeros((3, m.nv), dtype=np.float64)
+            self._jacr_buf = np.zeros((3, m.nv), dtype=np.float64)
+            # Stacked task: 3 orientation rows + 1 height row (pelvis-frame z).
+            self._task_dlam_I4 = self._look_dlam * np.eye(4, dtype=np.float64)
+            self._arm_jnt_lo = np.array(
+                [m.jnt_range[j, 0] for j in mj_jids], dtype=np.float64
+            )
+            self._arm_jnt_hi = np.array(
+                [m.jnt_range[j, 1] for j in mj_jids], dtype=np.float64
+            )
+            self._dq_arm_ema = np.zeros(len(self.arm_joint_indices), dtype=np.float64)
+        else:
+            self.arm_sdk_publisher = None
 
         self.lowstate_subscriber = ChannelSubscriber("rt/lowstate", LowState_)
         self.lowstate_subscriber.Init(self.LowStateHandler, 0)
@@ -116,7 +171,11 @@ class Manager:
                 realsense_device=self.realsense_wrist,
                 use_internal_frame_loop=False,
             )
-        self.setup_visualization()
+        if self._visualization:
+            self.setup_visualization()
+        else:
+            self.visualizer = None
+
         if point_tracker_port > 0 and self.point_tracker_remote is not None:
             port = point_tracker_port
             tracker = self.point_tracker_remote
@@ -153,7 +212,7 @@ class Manager:
                 "/realsense_head/color",
                 self.realsense_head,
                 (self._rs_height, self._rs_width, 3),
-                frustum_depth=self._cam_image_depth,
+                frustum_depth=0.4,
                 robot_model=self.robot_model,
                 site_name="d435_head",
             )
@@ -162,7 +221,7 @@ class Manager:
                 "/realsense_wrist/color",
                 self.realsense_wrist,
                 (self._rs_height, self._rs_width, 3),
-                frustum_depth=self._cam_image_depth,
+                frustum_depth=0.4,
                 robot_model=self.robot_model,
                 site_name="d435_wrist",
             )
@@ -188,13 +247,11 @@ class Manager:
                 )
         self.visualizer.run_async(freq=20)
 
-    def _update_point_tracker_visualization(self) -> None:
-        if self.point_tracker_remote is None:
-            return
-
-        tracked_points_camera, tracked_visibility = (
-            self.point_tracker_remote.get_tracked_points_snapshot()
-        )
+    def _update_point_tracker_visualization(
+        self,
+        tracked_points_camera: np.ndarray | None,
+        tracked_visibility: np.ndarray | None,
+    ) -> None:
         if tracked_points_camera is None or tracked_visibility is None:
             self.visualizer.set_tracker_points(None)
             return
@@ -244,8 +301,11 @@ class Manager:
         self.jpos = np.asarray([msg.motor_state[i].q for i in range(29)])
         self.jvel = np.asarray([msg.motor_state[i].dq for i in range(29)])
         self.quat_wxyz = np.asarray(msg.imu_state.quaternion)
+        self.imu_rpy = np.asarray(msg.imu_state.rpy, dtype=np.float64).copy()
+        # qpos: [0:3] free-joint pos from odom; [3:7] pelvis quat wxyz (IMU);
+        # [7:36] hinge angles in SDK order (same as joint_names in XML after free joint).
         self._qpos[3:7] = self.quat_wxyz
-        self._qpos[7 : 7 + len(self.jpos)] = self.jpos
+        self._qpos[7:] = self.jpos
         self._initial_lowstate.set()
 
     @timer_decorator
@@ -253,24 +313,139 @@ class Manager:
         self._qpos[0:3] = msg.position
         self._initial_odom.set()
 
+    def compute_arm_control(self, points: np.ndarray | None) -> None:
+        # KEEP THIS COMMENT
+        # compute arm (only arm joints) control for the following cases:
+        # 1. points is None: gaze along pelvis forward in body (_pelvis_forward_body) rotated by
+        #    the same IMU quat as _qpos[3:7], projected to horizontal (normal _world_horizontal_normal).
+        # 2. points is not None: let left_wrist_yaw_link face the center of the points
+        # for both cases: align link +Z with world right [0,-1,0] (_world_up); keep wrist origin at _wrist_height_in_root (m) along pelvis +Z
+        # leave the right arm where it is
+        # get the joint states from self.jpos, self.jvel,
+        # and jacobian from self.robot_model.mj_data.
+
+        if self.arm_sdk_publisher is None:
+            return
+
+        m = self.robot_model.mj_model
+        d = self.robot_model.mj_data
+        # arm_joint_indices = SDK motor indices 15..21; MuJoCo hinge joint ids are +1 (joint 0 is free).
+        arm_sdk = self.arm_joint_indices
+        dof_cols = self._arm_dof_cols
+
+        pos_w, R_wrist = self.robot_model.get_body_frame("left_wrist_yaw_link")
+        pos_root, R_root = self.robot_model.get_body_frame("pelvis")
+        wl = self._wrist_look_axis_body
+        forward = R_wrist @ wl
+        forward = forward / (np.linalg.norm(forward) + 1e-9)
+
+        if points is None:
+            q = self._qpos[3:7].astype(np.float64).copy()
+            if self._imu_quat_wxyz_conjugate:
+                q[1:4] *= -1.0
+            mujoco.mju_quat2Mat(self._quat_mat9, q)
+            R_bw = self._quat_mat9.reshape(3, 3)
+            fwd_w = R_bw @ self._pelvis_forward_body
+            n_h = self._world_horizontal_normal
+            fwd_des = fwd_w - float(fwd_w @ n_h) * n_h
+            n = np.linalg.norm(fwd_des)
+            if n < 1e-9:
+                # Pelvis forward parallel to “up”; fallback along horizontal basis ex.
+                ex = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+                fwd_des = ex - float(ex @ n_h) * n_h
+                n = np.linalg.norm(fwd_des)
+                if n < 1e-9:
+                    fwd_des = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+                else:
+                    fwd_des /= n
+            else:
+                fwd_des /= n
+        else:
+            point_center = np.mean(np.asarray(points, dtype=np.float64), axis=0)
+            fwd_des = point_center - pos_w
+            n = np.linalg.norm(fwd_des)
+            if n < 1e-6:
+                fwd_des = forward.copy()
+            else:
+                fwd_des = fwd_des / n
+
+        omega_fwd = np.cross(forward, fwd_des)
+        up_b = R_wrist[:, 2]
+        up_b = up_b / (np.linalg.norm(up_b) + 1e-9)
+        omega_up = np.cross(up_b, self._world_up)
+
+        r = pos_w - pos_root
+        p_local = R_root.T @ r
+        err_h = self._wrist_height_in_root - float(p_local[2])
+        err_h = float(np.clip(err_h, -self._height_err_clip, self._height_err_clip))
+
+        jacp = self._jacp_buf
+        jacr = self._jacr_buf
+        mujoco.mj_jacBody(m, d, jacp, jacr, self._left_wrist_body_id)
+        J_r = jacr[:, dof_cols]
+        z_w = R_root[:, 2]
+        J_h = (z_w @ jacp)[dof_cols].reshape(1, -1)
+
+        e = np.empty(4, dtype=np.float64)
+        e[:3] = self._look_gain * omega_fwd + self._up_align_gain * omega_up
+        n_omega = float(np.linalg.norm(e[:3]))
+        if n_omega > self._omega_task_max:
+            e[:3] *= self._omega_task_max / (n_omega + 1e-12)
+        e[3] = self._height_gain * err_h
+        J_stack = np.vstack([J_r, J_h])
+        M = J_stack @ J_stack.T + self._task_dlam_I4
+        dq_raw = J_stack.T @ np.linalg.solve(M, e)
+        dq_raw *= self._ik_step_scale
+        dq_raw = np.clip(dq_raw, -self._look_dq_max, self._look_dq_max)
+        self._dq_arm_ema = (1.0 - self._ik_dq_ema_beta) * self._dq_arm_ema
+        self._dq_arm_ema += self._ik_dq_ema_beta * dq_raw
+
+        q_arm = self.jpos[arm_sdk] + self._dq_arm_ema
+        q_arm = np.clip(q_arm, self._arm_jnt_lo, self._arm_jnt_hi)
+
+        self.low_cmd.motor_cmd[G1JointIndex.kNotUsedJoint].q = 1.0
+
+        for i in range(29):
+            self.low_cmd.motor_cmd[i].tau = 0.0
+            self.low_cmd.motor_cmd[i].dq = float(self.jvel[i])
+            self.low_cmd.motor_cmd[i].kp = self._arm_kp
+            self.low_cmd.motor_cmd[i].kd = self._arm_kd
+            self.low_cmd.motor_cmd[i].q = float(self.jpos[i])
+
+        for k, sdk_i in enumerate(arm_sdk):
+            self.low_cmd.motor_cmd[sdk_i].q = q_arm[k]
+
+        self.low_cmd.crc = self.crc.Crc(self.low_cmd)
+        self.arm_sdk_publisher.Write(self.low_cmd)
+
     def run(self) -> None:
+        timer = Timer(0.02)
         try:
             for step in itertools.count():
                 t0 = time.perf_counter()
-                self.robot_model.update(self._qpos)
+                points: np.ndarray | None = None
                 if self.point_tracker_remote is not None:
                     self.point_tracker_remote.update()
-                self._update_point_tracker_visualization()
+                    points, visibility = (
+                        self.point_tracker_remote.get_tracked_points_snapshot()
+                    )
+                    self._update_point_tracker_visualization(points, visibility)
+                self.robot_model.update(
+                    self._qpos, jacobian=self.arm_sdk_publisher is not None
+                )
+                if self.arm_sdk_publisher is not None:
+                    self.compute_arm_control(points)
                 if step % 50 == 0:
                     msg = f"LowStateHandler freq: {self.LowStateHandler.freq:.1f} Hz, SportModeStateHandler freq: {self.SportModeStateHandler.freq:.1f} Hz"
                     print(msg)
-                print(time.perf_counter() - t0)
+                timer.sleep()
         except KeyboardInterrupt:
             pass
         finally:
             if self.point_tracker_remote is not None:
                 self.point_tracker_remote.stop()
-            self.visualizer.stop_async()
+            if self.visualizer is not None:
+                self.visualizer.stop_async()
             if self.realsense_head is not None:
                 print("Stopping RealSense head...")
                 self.realsense_head.stop()
