@@ -455,6 +455,23 @@ class PointTrackerRemote:
                 self.stats_message,
             )
 
+    def get_tracked_points_snapshot(
+        self,
+    ) -> tuple[np.ndarray | None, np.ndarray | None]:
+        """Thread-safe copies of the latest tracked camera-frame XYZ and visibility."""
+        with self._lock:
+            points_camera = (
+                None
+                if self.tracked_points_camera is None
+                else self.tracked_points_camera.copy()
+            )
+            visibility = (
+                None
+                if self.tracked_visibility is None
+                else self.tracked_visibility.copy()
+            )
+        return points_camera, visibility
+
     def build_ui(self) -> gr.Blocks:
         with gr.Blocks(title="Point tracker (remote)") as demo:
             gr.Markdown(

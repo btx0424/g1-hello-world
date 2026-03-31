@@ -116,6 +116,7 @@ class ViserVisualizer:
         self.server = viser.ViserServer()
         self.robot_model_handles: list[ViserRobotModelHandle] = []
         self.camera_handles: list[ViserCameraHandle] = []
+        self._tracker_points_handle: viser.PointCloudHandle | None = None
         self._async_stop = threading.Event()
         self._async_thread: threading.Thread | None = None
 
@@ -155,6 +156,44 @@ class ViserVisualizer:
         handle = ViserRobotModelHandle(self.server.scene, robot_model, body_names)
         self.robot_model_handles.append(handle)
         return handle
+
+    def set_tracker_points(
+        self,
+        points: np.ndarray | None,
+        *,
+        colors: np.ndarray | tuple[int, int, int] = (0, 255, 0),
+        point_size: float = 0.04,
+        name: str = "/tracker/points",
+    ) -> None:
+        if self._tracker_points_handle is not None:
+            self._tracker_points_handle.remove()
+            self._tracker_points_handle = None
+
+        if points is None:
+            return
+
+        pts = np.asarray(points, dtype=np.float32)
+        if pts.ndim != 2 or pts.shape[1] != 3:
+            raise ValueError("points must have shape (N, 3)")
+
+        finite_mask = np.all(np.isfinite(pts), axis=1)
+        pts = pts[finite_mask]
+        if pts.shape[0] == 0:
+            return
+
+        rgb = np.asarray(colors)
+        if rgb.ndim == 2:
+            if rgb.shape != (len(points), 3):
+                raise ValueError("colors must have shape (N, 3)")
+            rgb = rgb[finite_mask]
+
+        self._tracker_points_handle = self.server.scene.add_point_cloud(
+            name=name,
+            points=pts,
+            colors=rgb,
+            point_size=point_size,
+            point_shape="circle",
+        )
 
     def run_async(self, freq: float = 20.0) -> None:
         """

@@ -53,7 +53,19 @@ class RealSenseDeviceManager:
         if enable_color:
             cfg.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
 
-        self._pipeline.start(cfg)
+        try:
+            self._pipeline.start(cfg)
+        except RuntimeError as e:
+            err = str(e).lower()
+            if "errno=16" in err or "device or resource busy" in err:
+                raise RuntimeError(
+                    "RealSense 打不开彩色流（depth/红外通常仍可用）：在 Jetson/Linux 上 pip 的 "
+                    "pyrealsense2 常走 V4L2，会与内核冲突。请从源码编译 librealsense，CMake 加 "
+                    "-DFORCE_RSUSB_BACKEND=ON，再安装/指向该版本的 pyrealsense2；并确认无其他程序 "
+                    "占用 RGB（sudo fuser -v /dev/video*）。原始错误: "
+                    + str(e)
+                ) from e
+            raise
 
         if enable_color:
             profile = (

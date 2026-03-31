@@ -18,6 +18,7 @@ from unitree_sdk2py.core.channel import ChannelSubscriber, ChannelFactoryInitial
 from unitree_sdk2py.idl.unitree_go.msg.dds_ import SportModeState_
 from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_
 
+from g1_hello_world.constants import R_SITE_FROM_OPENCV
 from g1_hello_world.realsense_device import RealSenseDeviceManager
 from g1_hello_world.robot_model import RobotModelWrapper
 from g1_hello_world.timing import timer_decorator
@@ -51,7 +52,8 @@ class Manager:
             self._rs_height,
             self._rs_fps,
             # serial="236422074588",
-            serial="140122071098",
+            # serial="140122071098",
+            serial="347622073775",
             enable_color=True,
             enable_depth=True,
         )
@@ -149,6 +151,35 @@ class Manager:
                 rgb, depth, capture_ms=capture_ms
             )
 
+    def _update_point_tracker_visualization(self) -> None:
+        if self.point_tracker_remote is None:
+            return
+
+        tracked_points_camera, tracked_visibility = (
+            self.point_tracker_remote.get_tracked_points_snapshot()
+        )
+        if tracked_points_camera is None or tracked_visibility is None:
+            self.visualizer.set_tracker_points(None)
+            return
+
+        pos_link, world_from_link = self.robot_model.get_site_frame("d435")
+        world_from_cv = world_from_link @ R_SITE_FROM_OPENCV
+        tracked_points_world = (
+            tracked_points_camera @ world_from_cv.T
+        ) + pos_link[None, :]
+
+        colors = np.tile(
+            np.array([[255, 0, 0]], dtype=np.uint8),
+            (tracked_points_world.shape[0], 1),
+        )
+        colors[np.asarray(tracked_visibility, dtype=bool)] = np.array(
+            [0, 255, 0], dtype=np.uint8
+        )
+        self.visualizer.set_tracker_points(
+            tracked_points_world,
+            colors=colors,
+        )
+
     def _wait_for_initial_pose(self, timeout_s: float) -> bool:
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
@@ -193,6 +224,7 @@ class Manager:
                 rgb, depth = self.realsense.read_aligned_rgb_depth(timeout_s=0.25)
                 capture_ms = (time.perf_counter() - t_cap) * 1000.0
                 self._forward_point_tracker_frame(rgb, depth, capture_ms)
+                self._update_point_tracker_visualization()
                 # if self.point_tracker_remote is not None:
                 #     print(
                 #         f"Capture: {capture_ms:.1f} ms, Point tracker: "
