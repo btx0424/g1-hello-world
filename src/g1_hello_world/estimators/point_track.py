@@ -18,7 +18,7 @@ import numpy as np
 import zmq
 
 from g1_hello_world.constants import R_SITE_FROM_OPENCV
-from g1_hello_world.realsense_device import RealSenseDeviceManager
+from g1_hello_world.cameras import RealSenseDeviceManager
 
 
 def encode_rgb_jpeg(rgb: np.ndarray, quality: int) -> bytes:

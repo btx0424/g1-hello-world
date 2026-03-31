@@ -7,39 +7,40 @@ from weakref import WeakKeyDictionary
 
 
 class _BoundTimed:
-    __slots__ = ("_fn", "_inst", "_last_t", "_ema_dt", "_alpha")
+    __slots__ = ("_fn", "_inst", "_count_total", "_freq_count_prev", "_freq_t_prev")
 
-    def __init__(self, fn: Callable[..., Any], inst: Any, *, alpha: float) -> None:
+    def __init__(self, fn: Callable[..., Any], inst: Any) -> None:
         self._fn = fn
         self._inst = inst
-        self._last_t: float | None = None
-        self._ema_dt: float | None = None
-        self._alpha = alpha
+        self._count_total = 0
+        self._freq_count_prev: int | None = None
+        self._freq_t_prev: float | None = None
 
     @property
     def freq(self) -> float:
-        if self._ema_dt is None or self._ema_dt <= 0.0:
+        now = time.monotonic()
+        if self._freq_t_prev is None or self._freq_count_prev is None:
+            self._freq_t_prev = now
+            self._freq_count_prev = self._count_total
             return 0.0
-        return 1.0 / self._ema_dt
+        dt = now - self._freq_t_prev
+        dc = self._count_total - self._freq_count_prev
+        self._freq_t_prev = now
+        self._freq_count_prev = self._count_total
+        if dt <= 0.0:
+            return 0.0
+        return float(dc) / dt
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
-        now = time.monotonic()
-        if self._last_t is not None:
-            dt = now - self._last_t
-            if self._ema_dt is None:
-                self._ema_dt = dt
-            else:
-                self._ema_dt = (1.0 - self._alpha) * self._ema_dt + self._alpha * dt
-        self._last_t = now
+        self._count_total += 1
         return self._fn(self._inst, *args, **kwargs)
 
 
 class _TimedMethod:
     """Descriptor: instance access returns a callable with a `.freq` property (Hz)."""
 
-    def __init__(self, fn: Callable[..., Any], *, alpha: float = 0.2) -> None:
+    def __init__(self, fn: Callable[..., Any]) -> None:
         self._fn = fn
-        self._alpha = alpha
         self._bound: WeakKeyDictionary[Any, _BoundTimed] = WeakKeyDictionary()
         update_wrapper(self, fn)
 
@@ -47,16 +48,15 @@ class _TimedMethod:
         if instance is None:
             return self
         if instance not in self._bound:
-            self._bound[instance] = _BoundTimed(self._fn, instance, alpha=self._alpha)
+            self._bound[instance] = _BoundTimed(self._fn, instance)
         return self._bound[instance]
 
 
 def timer_decorator(
-    fn: Callable[..., Any] | None = None, *, alpha: float = 0.2
+    fn: Callable[..., Any] | None = None
 ) -> _TimedMethod | Callable[[Callable[..., Any]], _TimedMethod]:
-    """Track callback rate with an EMA of inter-arrival times. Use ``self.Handler.freq`` (Hz)."""
+    """Track callback rate as call count divided by elapsed time between ``freq`` queries."""
 
     if fn is None:
-        return lambda f: _TimedMethod(f, alpha=alpha)
-    return _TimedMethod(fn, alpha=alpha)
-
+        return lambda f: _TimedMethod(f)
+    return _TimedMethod(fn)

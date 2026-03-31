@@ -8,7 +8,7 @@ import numpy as np
 import viser
 
 from .constants import R_SITE_FROM_OPENCV
-from .realsense_device import RealSenseDeviceManager
+from .cameras import RealSenseDeviceManager
 from .robot_model import RobotModelWrapper
 from .utils.string import resolve_matching_names
 

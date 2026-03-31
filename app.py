@@ -27,7 +27,7 @@ from g1_hello_world.constants import (
     T_LEFT_WRIST_LINK_END_TO_RGB_PLACEHOLDER,
     T_LEFT_WRIST_YAW_TO_LINK_END,
 )
-from g1_hello_world.realsense_device import RealSenseDeviceManager
+from g1_hello_world.cameras import RealSenseDeviceManager
 from g1_hello_world.robot_model import RobotModelWrapper
 from g1_hello_world.timing import timer_decorator
 from g1_hello_world.visualization import ViserVisualizer
@@ -42,6 +42,8 @@ class Manager:
         self,
         visualization: bool = True,
         arm_sdk: bool = True,
+        sim2sim: bool = False,
+        simulator = None,
         *,
         initial_pose_timeout_s: float = 10.0,
         track_server_endpoint: str = "tcp://127.0.0.1:5555",
@@ -49,47 +51,60 @@ class Manager:
     ) -> None:
         self._visualization = visualization
         self._initial_pose_timeout_s = initial_pose_timeout_s
-
-        self.msc = MotionSwitcherClient()
-        self.msc.SetTimeout(5.0)
-        self.msc.Init()
-
-        status, result = self.msc.CheckMode()
-        print(status, result)
-
-        for info in RealSenseDeviceManager.list_devices():
-            print(f"Device found: {info.name} (serial={info.serial})")
+        self._sim2sim = sim2sim
 
         self._rs_width, self._rs_height, self._rs_fps = 640, 480, 30
-        try:
-            self.realsense_head = RealSenseDeviceManager(
-                self._rs_width,
-                self._rs_height,
-                self._rs_fps,
-                serial=HEAD_SERIAL,
-                enable_color=True,
-                enable_depth=True,
-            )
-            self.realsense_head.start()
+        self.msc = None
+        self.realsense_head = None
+        self.realsense_wrist = None
+        self.ground_plane_estimator = None
+        self._simulator = simulator
+        if not self._sim2sim:
+            self.msc = MotionSwitcherClient()
+            self.msc.SetTimeout(5.0)
+            self.msc.Init()
+
+            status, result = self.msc.CheckMode()
+            print(status, result)
+
+            for info in RealSenseDeviceManager.list_devices():
+                print(f"Device found: {info.name} (serial={info.serial})")
+
+            try:
+                self.realsense_head = RealSenseDeviceManager(
+                    self._rs_width,
+                    self._rs_height,
+                    self._rs_fps,
+                    serial=HEAD_SERIAL,
+                    enable_color=True,
+                    enable_depth=True,
+                )
+                self.realsense_head.start()
+                self.ground_plane_estimator = GroundPlaneEstimator()
+            except Exception as e:
+                print(f"Error starting realsense_head: {e}")
+                self.realsense_head = None
+                self.ground_plane_estimator = None
+            
+            try:
+                self.realsense_wrist = RealSenseDeviceManager(
+                    self._rs_width,
+                    self._rs_height,
+                    self._rs_fps,
+                    serial=WRIST_SERIAL,
+                    enable_color=True,
+                    enable_depth=True,
+                )
+                self.realsense_wrist.start()
+            except Exception as e:
+                print(f"Error starting realsense_wrist: {e}")
+                self.realsense_wrist = None
+        else:
+            if self._simulator is None:
+                raise ValueError("sim2sim=True requires a simulator instance.")
+            self.realsense_head = self._simulator.head_camera
+            self.realsense_wrist = self._simulator.wrist_camera
             self.ground_plane_estimator = GroundPlaneEstimator()
-        except Exception as e:
-            print(f"Error starting realsense_head: {e}")
-            self.realsense_head = None
-            self.ground_plane_estimator = None
-        
-        try:
-            self.realsense_wrist = RealSenseDeviceManager(
-                self._rs_width,
-                self._rs_height,
-                self._rs_fps,
-                serial=WRIST_SERIAL,
-                enable_color=True,
-                enable_depth=True,
-            )
-            self.realsense_wrist.start()
-        except Exception as e:
-            print(f"Error starting realsense_wrist: {e}")
-            self.realsense_wrist = None
 
         self.robot_model = RobotModelWrapper("robot_model/g1_29dof_rev_1_0.xml")
         self._qpos = np.zeros(self.robot_model.mj_model.nq, dtype=np.float64)
@@ -110,8 +125,9 @@ class Manager:
             # this should give us:
             # [15, 16, 17, 18, 19, 20, 21]
             # ['left_shoulder_pitch_joint', 'left_shoulder_roll_joint', 'left_shoulder_yaw_joint', 'left_elbow_joint', 'left_wrist_roll_joint', 'left_wrist_pitch_joint', 'left_wrist_yaw_joint']
-            self._arm_kp = 60.0
-            self._arm_kd = 1.5
+            self._arm_kp = 42.0
+            self._arm_kd = 2.8
+            self._control_dt = 0.02
             self._look_gain = 2.5
             self._look_dlam = 0.06
             self._look_dq_max = 0.08
@@ -163,6 +179,9 @@ class Manager:
                 [m.jnt_range[j, 1] for j in mj_jids], dtype=np.float64
             )
             self._dq_arm_ema = np.zeros(len(self.arm_joint_indices), dtype=np.float64)
+            self._dq_cmd_max = 1.2
+            self._q_arm_cmd = np.zeros(len(self.arm_joint_indices), dtype=np.float64)
+            self._arm_cmd_initialized = False
         else:
             self.arm_sdk_publisher = None
 
@@ -339,6 +358,9 @@ class Manager:
         # arm_joint_indices = SDK motor indices 15..21; MuJoCo hinge joint ids are +1 (joint 0 is free).
         arm_sdk = self.arm_joint_indices
         dof_cols = self._arm_dof_cols
+        if not self._arm_cmd_initialized:
+            self._q_arm_cmd[:] = self.jpos[arm_sdk]
+            self._arm_cmd_initialized = True
 
         pos_w, R_wrist = self.robot_model.get_body_frame("left_wrist_yaw_link")
         pos_cam, world_from_link = self.robot_model.get_site_frame("d435_wrist")
@@ -458,20 +480,24 @@ class Manager:
         self._dq_arm_ema = (1.0 - self._ik_dq_ema_beta) * self._dq_arm_ema
         self._dq_arm_ema += self._ik_dq_ema_beta * dq_raw
 
-        q_arm = self.jpos[arm_sdk] + self._dq_arm_ema
-        q_arm = np.clip(q_arm, self._arm_jnt_lo, self._arm_jnt_hi)
+        dq_arm_cmd = self._dq_arm_ema / self._control_dt
+        dq_arm_cmd = np.clip(dq_arm_cmd, -self._dq_cmd_max, self._dq_cmd_max)
+        self._q_arm_cmd += dq_arm_cmd * self._control_dt
+        self._q_arm_cmd = np.clip(self._q_arm_cmd, self._arm_jnt_lo, self._arm_jnt_hi)
+        q_arm = self._q_arm_cmd.copy()
 
         self.low_cmd.motor_cmd[G1JointIndex.kNotUsedJoint].q = 1.0
 
         for i in range(29):
             self.low_cmd.motor_cmd[i].tau = 0.0
-            self.low_cmd.motor_cmd[i].dq = float(self.jvel[i])
+            self.low_cmd.motor_cmd[i].dq = 0.0
             self.low_cmd.motor_cmd[i].kp = self._arm_kp
             self.low_cmd.motor_cmd[i].kd = self._arm_kd
             self.low_cmd.motor_cmd[i].q = float(self.jpos[i])
 
         for k, sdk_i in enumerate(arm_sdk):
             self.low_cmd.motor_cmd[sdk_i].q = q_arm[k]
+            self.low_cmd.motor_cmd[sdk_i].dq = float(dq_arm_cmd[k])
 
         self.low_cmd.crc = self.crc.Crc(self.low_cmd)
         self.arm_sdk_publisher.Write(self.low_cmd)
@@ -515,6 +541,11 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="G1 hello-world Viser + RealSense viewer")
     parser.add_argument("--iface", default="eth0", help="Network interface for DDS")
     parser.add_argument(
+        "--sim2sim",
+        action="store_true",
+        help="Start a local MuJoCo-based DDS emulator before running the app. Use with --iface lo.",
+    )
+    parser.add_argument(
         "--point-tracker-port",
         type=int,
         default=0,
@@ -529,12 +560,33 @@ def _parse_args() -> argparse.Namespace:
 
 
 if __name__ == "__main__":
-
     args = _parse_args()
     ChannelFactoryInitialize(0, args.iface)
+
+    # Real robot:
+    #   uv run app.py --iface eth0
+    #
+    # Local sim2sim smoke test without hardware:
+    #   uv run app.py --iface lo --sim2sim
+    #
+    # In sim2sim mode we start a MuJoCo publisher thread from sim2sim.py that emits
+    # rt/lowstate and rt/odommodestate on the local DDS transport. Manager then skips
+    # MotionSwitcher / RealSense setup and subscribes to those simulated channels.
+    simulator = None
+    if args.sim2sim:
+        from sim2sim import Sim2Sim
+
+        simulator = Sim2Sim()
+        simulator.start()
 
     manager = Manager(
         point_tracker_port=args.point_tracker_port,
         track_server_endpoint=args.track_server,
+        sim2sim=args.sim2sim,
+        simulator=simulator,
     )
-    manager.run()
+    try:
+        manager.run()
+    finally:
+        if simulator is not None:
+            simulator.stop()

@@ -2,7 +2,7 @@ import numpy as np
 import trimesh
 
 from g1_hello_world.constants import R_SITE_FROM_OPENCV
-from g1_hello_world.realsense_device import RealSenseDeviceManager
+from g1_hello_world.cameras import RealSenseDeviceManager
 from g1_hello_world.robot_model import RobotModelWrapper
 
 
