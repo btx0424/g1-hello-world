@@ -249,17 +249,16 @@ class Manager:
 
     def _update_point_tracker_visualization(
         self,
-        tracked_points_camera: np.ndarray | None,
+        tracked_points_link: np.ndarray | None,
         tracked_visibility: np.ndarray | None,
     ) -> None:
-        if tracked_points_camera is None or tracked_visibility is None:
+        if tracked_points_link is None or tracked_visibility is None:
             self.visualizer.set_tracker_points(None)
             return
 
         pos_link, world_from_link = self.robot_model.get_site_frame("d435_wrist")
-        world_from_cv = world_from_link @ R_SITE_FROM_OPENCV
         tracked_points_world = (
-            tracked_points_camera @ world_from_cv.T
+            tracked_points_link @ world_from_link.T
         ) + pos_link[None, :]
 
         colors = np.tile(
@@ -334,6 +333,7 @@ class Manager:
         dof_cols = self._arm_dof_cols
 
         pos_w, R_wrist = self.robot_model.get_body_frame("left_wrist_yaw_link")
+        pos_cam, world_from_link = self.robot_model.get_site_frame("d435_wrist")
         pos_root, R_root = self.robot_model.get_body_frame("pelvis")
         wl = self._wrist_look_axis_body
         forward = R_wrist @ wl
@@ -361,18 +361,46 @@ class Manager:
             else:
                 fwd_des /= n
         else:
-            point_center = np.mean(np.asarray(points, dtype=np.float64), axis=0)
-            fwd_des = point_center - pos_w
+            points_link = np.asarray(points, dtype=np.float64)
+            points_world = (points_link @ world_from_link.T) + pos_cam[None, :]
+            valid = np.all(np.isfinite(points_world), axis=1)
+            if np.any(valid):
+                point_center = np.mean(points_world[valid], axis=0)
+            else:
+                point_center = pos_cam + forward
+            # Aim the wrist camera optical center at the tracked point, not the wrist-body origin.
+            fwd_des = point_center - pos_cam
             n = np.linalg.norm(fwd_des)
             if n < 1e-6:
                 fwd_des = forward.copy()
             else:
                 fwd_des = fwd_des / n
 
-        omega_fwd = np.cross(forward, fwd_des)
-        up_b = R_wrist[:, 2]
-        up_b = up_b / (np.linalg.norm(up_b) + 1e-9)
-        omega_up = np.cross(up_b, self._world_up)
+        right_ref = self._world_up.copy()
+        right_ref -= float(right_ref @ fwd_des) * fwd_des
+        n_right = np.linalg.norm(right_ref)
+        if n_right < 1e-6:
+            right_ref = R_wrist[:, 2].copy()
+            right_ref -= float(right_ref @ fwd_des) * fwd_des
+            n_right = np.linalg.norm(right_ref)
+        if n_right < 1e-6:
+            fallback = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+            if abs(float(fallback @ fwd_des)) > 0.95:
+                fallback = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+            right_ref = fallback - float(fallback @ fwd_des) * fwd_des
+            n_right = np.linalg.norm(right_ref)
+        z_des = right_ref / (n_right + 1e-9)
+        y_des = np.cross(z_des, fwd_des)
+        y_des /= np.linalg.norm(y_des) + 1e-9
+        z_des = np.cross(fwd_des, y_des)
+        z_des /= np.linalg.norm(z_des) + 1e-9
+
+        R_des = np.column_stack((fwd_des, y_des, z_des))
+        omega = 0.5 * (
+            np.cross(R_wrist[:, 0], R_des[:, 0])
+            + np.cross(R_wrist[:, 1], R_des[:, 1])
+            + np.cross(R_wrist[:, 2], R_des[:, 2])
+        )
 
         r = pos_w - pos_root
         p_local = R_root.T @ r
@@ -387,7 +415,7 @@ class Manager:
         J_h = (z_w @ jacp)[dof_cols].reshape(1, -1)
 
         e = np.empty(4, dtype=np.float64)
-        e[:3] = self._look_gain * omega_fwd + self._up_align_gain * omega_up
+        e[:3] = self._look_gain * omega
         n_omega = float(np.linalg.norm(e[:3]))
         if n_omega > self._omega_task_max:
             e[:3] *= self._omega_task_max / (n_omega + 1e-12)

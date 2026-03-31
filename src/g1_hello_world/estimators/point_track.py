@@ -18,6 +18,7 @@ import gradio as gr
 import numpy as np
 import zmq
 
+from g1_hello_world.constants import R_SITE_FROM_OPENCV
 from g1_hello_world.realsense_device import RealSenseDeviceManager
 
 
@@ -89,7 +90,7 @@ class PointTrackerRemote:
         self.latest_rgb_preview: np.ndarray | None = None
         self.tracked_points: np.ndarray | None = None
         self.tracked_visibility: np.ndarray | None = None
-        self.tracked_points_camera: np.ndarray | None = None
+        self.tracked_points_link: np.ndarray | None = None
 
         self.tracking_active: bool = False
         self.status_message: str = "Idle."
@@ -175,10 +176,10 @@ class PointTrackerRemote:
             if 0 <= xi < w and 0 <= yi < h:
                 color = (0, 255, 0) if bool(visible) else (255, 0, 0)
                 cv2.circle(out, (xi, yi), self.point_radius, color, -1)
-                if self.tracked_points_camera is not None and idx < len(
-                    self.tracked_points_camera
+                if self.tracked_points_link is not None and idx < len(
+                    self.tracked_points_link
                 ):
-                    xyz = self.tracked_points_camera[idx]
+                    xyz = self.tracked_points_link[idx]
                     if np.all(np.isfinite(xyz)):
                         label = (
                             f"{idx}: {xyz[0]:+.2f} {xyz[1]:+.2f} {xyz[2]:+.2f}m"
@@ -225,13 +226,14 @@ class PointTrackerRemote:
                     tracked_points_camera = self._rs.compute_camera_points(
                         depth, tracked_points
                     )
+                    tracked_points_link = tracked_points_camera @ R_SITE_FROM_OPENCV.T
                     valid_xyz_count = int(
                         np.isfinite(tracked_points_camera[:, 2]).sum()
                     )
                     with self._lock:
                         self.tracked_points = tracked_points
                         self.tracked_visibility = tracked_visibility
-                        self.tracked_points_camera = tracked_points_camera
+                        self.tracked_points_link = tracked_points_link
                 else:
                     with self._lock:
                         self._set_status(
@@ -339,7 +341,7 @@ class PointTrackerRemote:
             self.tracking_active = False
             self.latest_rgb_frame = None
             self.latest_rgb_preview = None
-            self.tracked_points_camera = None
+            self.tracked_points_link = None
             self._set_status("Remote tracker stopped.")
         if thread is not None and thread.is_alive():
             thread.join(timeout=1.0)
@@ -423,7 +425,7 @@ class PointTrackerRemote:
                 return self.status_message
             self.tracked_points = np.asarray(response["points"], dtype=np.float32)
             self.tracked_visibility = np.asarray(response["visibility"], dtype=bool)
-            self.tracked_points_camera = None
+            self.tracked_points_link = None
             self.tracking_active = True
             stats = response.get("stats", {})
             self.stats_message = (
@@ -444,19 +446,19 @@ class PointTrackerRemote:
     def get_tracked_points_snapshot(
         self,
     ) -> tuple[np.ndarray | None, np.ndarray | None]:
-        """Thread-safe copies of the latest tracked camera-frame XYZ and visibility."""
+        """Thread-safe copies of the latest tracked MuJoCo camera-link-frame XYZ and visibility."""
         with self._lock:
-            points_camera = (
+            points_link = (
                 None
-                if self.tracked_points_camera is None
-                else self.tracked_points_camera.copy()
+                if self.tracked_points_link is None
+                else self.tracked_points_link.copy()
             )
             visibility = (
                 None
                 if self.tracked_visibility is None
                 else self.tracked_visibility.copy()
             )
-        return points_camera, visibility
+        return points_link, visibility
 
     def build_ui(self) -> gr.Blocks:
         with gr.Blocks(title="Point tracker (remote)") as demo:
