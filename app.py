@@ -6,11 +6,14 @@ import itertools
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 import mujoco
 import numpy as np
 import trimesh
 import logging
+import requests
+import zmq
 
 logging.basicConfig(level=logging.INFO)
 
@@ -34,6 +37,8 @@ from g1_hello_world.timing import timer_decorator
 from g1_hello_world.visualization import ViserVisualizer
 from g1_hello_world.estimators import GroundPlaneEstimator, PointTrackerRemote
 from g1_hello_world.utils.timerfd import Timer
+from query import DEFAULT_PORT as DEFAULT_SEGMENTATION_PORT
+from query import DEFAULT_SERVER_ADDRESS as DEFAULT_SEGMENTATION_SERVER
 
 try:
     import pinocchio as pin
@@ -51,6 +56,190 @@ LEFT_ARM_JOINT_NAMES = (
     "left_wrist_pitch_joint",
     "left_wrist_yaw_joint",
 )
+
+
+class HeadSegmentationProxyServer:
+    """ZMQ REP server that forwards head-camera RGB frames to the HTTP segmentation service."""
+
+    def __init__(
+        self,
+        *,
+        camera_device: RealSenseDeviceManager | ZmqSimCameraDevice,
+        point_tracker_remote: PointTrackerRemote | None,
+        bind_endpoint: str,
+        segmentation_server: str,
+        segmentation_port: int,
+        request_timeout_s: float = 15.0,
+    ) -> None:
+        self._camera_device = camera_device
+        self._point_tracker_remote = point_tracker_remote
+        self._bind_endpoint = bind_endpoint
+        self._segmentation_server = segmentation_server
+        self._segmentation_port = int(segmentation_port)
+        self._request_timeout_s = float(request_timeout_s)
+        self._context = zmq.Context.instance()
+        self._socket: zmq.Socket | None = None
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def _read_head_rgb(self) -> np.ndarray:
+        rgb, _ = self._camera_device.read_aligned_rgb_depth(timeout_s=1.0)
+        return rgb
+
+    def _post_segmentation_request(
+        self,
+        *,
+        rgb: np.ndarray,
+        target_type: str,
+        predict_endpoint: str,
+        timeout_s: float,
+    ) -> dict[str, Any]:
+        ok, encoded = cv2.imencode(
+            ".jpg",
+            cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR),
+            [int(cv2.IMWRITE_JPEG_QUALITY), 95],
+        )
+        if not ok:
+            raise RuntimeError("Failed to encode head RGB frame as JPEG.")
+        url = (
+            f"http://{self._segmentation_server}:{self._segmentation_port}"
+            f"{predict_endpoint}"
+        )
+        response = requests.post(
+            url,
+            data={"target_type": target_type},
+            files={
+                "file": (
+                    "head_camera.jpg",
+                    encoded.tobytes(),
+                    "image/jpeg",
+                )
+            },
+            timeout=timeout_s,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise ValueError("Segmentation server did not return a JSON object.")
+        return payload
+
+    @staticmethod
+    def _extract_bboxes(payload: dict[str, Any]) -> dict[str, list[int]]:
+        out: dict[str, list[int]] = {}
+        for key in ("handle", "local_white_region", "global_white_door_region"):
+            value = payload.get(key)
+            if isinstance(value, dict) and isinstance(value.get("bbox_xyxy"), list):
+                bbox = [int(v) for v in value["bbox_xyxy"][:4]]
+                if len(bbox) == 4:
+                    out[key] = bbox
+        return out
+
+    @staticmethod
+    def _bbox_corner_queries(bbox_xyxy: list[int]) -> list[tuple[int, int]]:
+        x_min, y_min, x_max, y_max = [int(v) for v in bbox_xyxy[:4]]
+        x_mid = int(round(0.5 * (x_min + x_max)))
+        y_mid = int(round(0.5 * (y_min + y_max)))
+        return [
+            (x_min, y_min),
+            (x_max, y_min),
+            (x_max, y_max),
+            (x_min, y_max),
+            (x_mid, y_mid),
+        ]
+
+    def _handle_request(self, request: Any) -> dict[str, Any]:
+        if not isinstance(request, dict):
+            return {"ok": False, "error": "request must be a dict"}
+        op = str(request.get("op", ""))
+        if op == "ping":
+            return {
+                "ok": True,
+                "status": "head-segmentation-proxy-ready",
+                "bind_endpoint": self._bind_endpoint,
+                "segmentation_server": self._segmentation_server,
+                "segmentation_port": self._segmentation_port,
+            }
+        if op != "segment_head":
+            return {"ok": False, "error": f"unknown op: {op!r}"}
+
+        target_type = str(request.get("target_type", "handle"))
+        predict_endpoint = str(request.get("predict_endpoint", "/predict"))
+        timeout_s = float(request.get("timeout_s", self._request_timeout_s))
+        t0 = time.perf_counter()
+        rgb = self._read_head_rgb()
+        capture_ms = (time.perf_counter() - t0) * 1000.0
+
+        t1 = time.perf_counter()
+        payload = self._post_segmentation_request(
+            rgb=rgb,
+            target_type=target_type,
+            predict_endpoint=predict_endpoint,
+            timeout_s=timeout_s,
+        )
+        request_ms = (time.perf_counter() - t1) * 1000.0
+        bboxes = self._extract_bboxes(payload)
+        tracker_submit_ok = False
+        tracker_submit_status: str | None = None
+        if self._point_tracker_remote is not None and "handle" in bboxes:
+            tracker_submit_status = self._point_tracker_remote.submit_query_points(
+                self._bbox_corner_queries(bboxes["handle"]),
+                capture_latest=True,
+            )
+            tracker_submit_ok = "Tracking started" in tracker_submit_status
+        return {
+            "ok": True,
+            "image_width": int(rgb.shape[1]),
+            "image_height": int(rgb.shape[0]),
+            "capture_ms": capture_ms,
+            "request_ms": request_ms,
+            "predict": payload,
+            "bboxes": bboxes,
+            "tracker_submit_ok": tracker_submit_ok,
+            "tracker_submit_status": tracker_submit_status,
+        }
+
+    def _serve(self) -> None:
+        sock = self._context.socket(zmq.REP)
+        sock.setsockopt(zmq.RCVTIMEO, 200)
+        sock.setsockopt(zmq.SNDTIMEO, 200)
+        sock.bind(self._bind_endpoint)
+        self._socket = sock
+        while not self._stop_event.is_set():
+            try:
+                request = sock.recv_pyobj()
+            except zmq.Again:
+                continue
+            except Exception as exc:
+                logging.warning("Head segmentation proxy receive failed: %s", exc)
+                continue
+            try:
+                response = self._handle_request(request)
+            except Exception as exc:
+                response = {"ok": False, "error": str(exc)}
+            try:
+                sock.send_pyobj(response)
+            except Exception as exc:
+                logging.warning("Head segmentation proxy send failed: %s", exc)
+
+    def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._serve,
+            name="head-segmentation-proxy",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+        self._thread = None
+        if self._socket is not None:
+            self._socket.close(linger=0)
+        self._socket = None
 
 
 class _BaseArmController:
@@ -461,6 +650,9 @@ class Manager:
         arm_sdk: bool = True,
         sim2sim: bool = False,
         arm_controller_backend: str = "mujoco",
+        head_segmentation_proxy_endpoint: str | None = None,
+        segmentation_server: str = DEFAULT_SEGMENTATION_SERVER,
+        segmentation_port: int = DEFAULT_SEGMENTATION_PORT,
         *,
         initial_pose_timeout_s: float = 10.0,
         track_server_endpoint: str = "tcp://127.0.0.1:5555",
@@ -471,12 +663,15 @@ class Manager:
         self._visualization = visualization
         self._initial_pose_timeout_s = initial_pose_timeout_s
         self._sim2sim = sim2sim
+        self._head_segmentation_proxy_endpoint = head_segmentation_proxy_endpoint
+        self._point_tracker_site_name = "d435_head"
 
         self._rs_width, self._rs_height, self._rs_fps = 640, 480, 30
         self.msc = None
         self.realsense_head = None
         self.realsense_wrist = None
         self.ground_plane_estimator = None
+        self.head_segmentation_proxy: HeadSegmentationProxyServer | None = None
         if not self._sim2sim:
             self.msc = MotionSwitcherClient()
             self.msc.SetTimeout(5.0)
@@ -569,12 +764,34 @@ class Manager:
         self.odom_subscriber.Init(self.SportModeStateHandler, 0)
 
         self.point_tracker_remote: PointTrackerRemote | None = None
-        if point_tracker_port > 0 and self.realsense_wrist is not None:
+        need_point_tracker = (
+            point_tracker_port > 0
+            or self._head_segmentation_proxy_endpoint is not None
+        )
+        if need_point_tracker and self.realsense_head is not None:
             self.point_tracker_remote = PointTrackerRemote(
                 server_endpoint=track_server_endpoint,
-                realsense_device=self.realsense_wrist,
+                realsense_device=self.realsense_head,
             )
             self.point_tracker_remote.start()
+        if (
+            self._head_segmentation_proxy_endpoint
+            and self.realsense_head is not None
+        ):
+            self.head_segmentation_proxy = HeadSegmentationProxyServer(
+                camera_device=self.realsense_head,
+                point_tracker_remote=self.point_tracker_remote,
+                bind_endpoint=self._head_segmentation_proxy_endpoint,
+                segmentation_server=segmentation_server,
+                segmentation_port=segmentation_port,
+            )
+            self.head_segmentation_proxy.start()
+            logging.info(
+                "Head segmentation proxy listening at %s -> http://%s:%s",
+                self._head_segmentation_proxy_endpoint,
+                segmentation_server,
+                segmentation_port,
+            )
         if self._visualization:
             self.setup_visualization()
         else:
@@ -660,7 +877,9 @@ class Manager:
             self.visualizer.set_tracker_points(None)
             return
 
-        pos_link, world_from_link = self.robot_model.get_site_frame("d435_wrist")
+        pos_link, world_from_link = self.robot_model.get_site_frame(
+            self._point_tracker_site_name
+        )
         tracked_points_world = (
             tracked_points_link @ world_from_link.T
         ) + pos_link[None, :]
@@ -729,16 +948,20 @@ class Manager:
         timer = Timer(0.02)
         try:
             for step in itertools.count():
-                t0 = time.perf_counter()
-                points: np.ndarray | None = None
+                tracked_points: np.ndarray | None = None
+                control_points: np.ndarray | None = None
                 if self.point_tracker_remote is not None:
-                    points, visibility = (
+                    tracked_points, visibility = (
                         self.point_tracker_remote.get_tracked_points_snapshot()
                     )
-                    self._update_point_tracker_visualization(points, visibility)
+                    self._update_point_tracker_visualization(
+                        tracked_points, visibility
+                    )
+                    if self._point_tracker_site_name == "d435_wrist":
+                        control_points = tracked_points
                 self.robot_model.update(self._qpos, jacobian=False)
                 if self.arm_sdk_publisher is not None:
-                    self.compute_arm_control(points)
+                    self.compute_arm_control(control_points)
                 if step % 50 == 0:
                     msg = f"LowStateHandler freq: {self.LowStateHandler.freq:.1f} Hz, SportModeStateHandler freq: {self.SportModeStateHandler.freq:.1f} Hz"
                     print(msg)
@@ -746,6 +969,8 @@ class Manager:
         except KeyboardInterrupt:
             pass
         finally:
+            if self.head_segmentation_proxy is not None:
+                self.head_segmentation_proxy.stop()
             if self.point_tracker_remote is not None:
                 self.point_tracker_remote.stop()
             if self.visualizer is not None:
@@ -773,6 +998,22 @@ def _parse_args() -> argparse.Namespace:
         choices=("mujoco", "pinocchio"),
         default="pinocchio",
         help="Left-arm controller backend.",
+    )
+    parser.add_argument(
+        "--head-segmentation-proxy-endpoint",
+        default="",
+        help="If non-empty, bind a ZMQ REP server here for `segment_head` requests.",
+    )
+    parser.add_argument(
+        "--segmentation-server",
+        default=DEFAULT_SEGMENTATION_SERVER,
+        help=f"HTTP segmentation server hostname or IP (default: {DEFAULT_SEGMENTATION_SERVER}).",
+    )
+    parser.add_argument(
+        "--segmentation-port",
+        type=int,
+        default=DEFAULT_SEGMENTATION_PORT,
+        help=f"HTTP segmentation server port (default: {DEFAULT_SEGMENTATION_PORT}).",
     )
     parser.add_argument(
         "--point-tracker-port",
@@ -803,6 +1044,10 @@ if __name__ == "__main__":
     #   terminal 1: uv run python sim2sim.py
     #   terminal 2: uv run app.py --iface lo --sim2sim
     #
+    # Optional head segmentation proxy:
+    #   uv run app.py --iface eth0 --head-segmentation-proxy-endpoint tcp://127.0.0.1:5562
+    #   Request payload: {"op": "segment_head", "target_type": "handle"}
+    #
     # In sim2sim mode, sim2sim.py runs as a separate process. It publishes DDS state
     # locally and streams rendered head/wrist RGB-D frames over ZMQ. Manager skips
     # MotionSwitcher / RealSense setup and connects receiver-side camera devices.
@@ -812,6 +1057,11 @@ if __name__ == "__main__":
         track_server_endpoint=args.track_server,
         sim2sim=args.sim2sim,
         arm_controller_backend=args.arm_controller_backend,
+        head_segmentation_proxy_endpoint=(
+            args.head_segmentation_proxy_endpoint or None
+        ),
+        segmentation_server=args.segmentation_server,
+        segmentation_port=args.segmentation_port,
         sim_head_camera_endpoint=args.sim_head_camera_endpoint,
         sim_wrist_camera_endpoint=args.sim_wrist_camera_endpoint,
     )
