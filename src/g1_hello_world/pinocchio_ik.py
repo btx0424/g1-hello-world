@@ -90,6 +90,11 @@ class RightArmPinocchioIK:
         q = self.neutral_configuration() if q_init is None else np.asarray(q_init, dtype=np.float64).copy()
         if q.shape != (self.model.nq,):
             raise ValueError(f"q_init must have shape ({self.model.nq},)")
+        q[self.arm_q_indices] = np.clip(
+            q[self.arm_q_indices],
+            self.arm_lower_limits,
+            self.arm_upper_limits,
+        )
 
         base_M_target = pin.SE3(pin.rpy.rpyToMatrix(*target_rpy_xyz), target_xyz)
 

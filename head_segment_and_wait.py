@@ -3,14 +3,23 @@ from __future__ import annotations
 import argparse
 import json
 import time
+from pathlib import Path
 from typing import Any
 
+import cv2
+import numpy as np
 import zmq
 
 from g1_hello_world.estimators.point_track import TRACKED_POINTS_PUB_ENDPOINT
 
 
 DEFAULT_PROXY_ENDPOINT = "tcp://127.0.0.1:5562"
+
+_BBOX_COLORS: dict[str, tuple[int, int, int]] = {
+    "handle": (0, 255, 0),
+    "local_white_region": (0, 255, 255),
+    "global_white_door_region": (255, 0, 0),
+}
 
 
 def _wait_for_reply(
@@ -77,6 +86,41 @@ def _wait_for_tracked_points(
         sock.close(linger=0)
 
 
+def _save_segmentation_visualization(
+    *,
+    reply: dict[str, Any],
+    output_path: str | Path,
+) -> Path:
+    """Write a bbox visualization image for the segmentation reply."""
+    width = int(reply.get("image_width", 1280))
+    height = int(reply.get("image_height", 720))
+    canvas = np.zeros((max(1, height), max(1, width), 3), dtype=np.uint8)
+
+    bboxes = reply.get("bboxes", {})
+    if isinstance(bboxes, dict):
+        for label, bbox_xyxy in bboxes.items():
+            if not isinstance(bbox_xyxy, list) or len(bbox_xyxy) < 4:
+                continue
+            x_min, y_min, x_max, y_max = [int(v) for v in bbox_xyxy[:4]]
+            color = _BBOX_COLORS.get(str(label), (200, 200, 200))
+            cv2.rectangle(canvas, (x_min, y_min), (x_max, y_max), color, 2)
+            cv2.putText(
+                canvas,
+                str(label),
+                (x_min, max(16, y_min - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                color,
+                1,
+                cv2.LINE_AA,
+            )
+
+    out_path = Path(output_path).expanduser().resolve()
+    if not cv2.imwrite(str(out_path), canvas):
+        raise RuntimeError(f"failed to save segmentation visualization to {out_path}")
+    return out_path
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
@@ -126,6 +170,11 @@ def main() -> None:
         default=3.0,
         help="Timeout in seconds to wait for a fresh tracked-points publication.",
     )
+    parser.add_argument(
+        "--viz-output",
+        default="head_segmentation_viz.png",
+        help="Output path for segmentation bbox visualization image.",
+    )
     args = parser.parse_args()
 
     reply, request_sent_at = _wait_for_reply(
@@ -137,6 +186,11 @@ def main() -> None:
     )
     print("Segmentation reply:")
     print(json.dumps(reply, indent=2))
+    viz_path = _save_segmentation_visualization(
+        reply=reply,
+        output_path=args.viz_output,
+    )
+    print(f"Saved segmentation bbox visualization to: {viz_path}")
 
     if not bool(reply.get("ok", False)):
         raise SystemExit("segmentation request failed")

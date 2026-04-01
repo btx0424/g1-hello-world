@@ -47,6 +47,7 @@ except ModuleNotFoundError:
 
 HEAD_SERIAL = "347622073775"
 WRIST_SERIAL = "236422074588"
+TRACKED_POINTS_PUB_ENDPOINT = "tcp://127.0.0.1:5560"
 LEFT_ARM_JOINT_NAMES = (
     "left_shoulder_pitch_joint",
     "left_shoulder_roll_joint",
@@ -647,7 +648,7 @@ class Manager:
     def __init__(
         self,
         visualization: bool = True,
-        arm_sdk: bool = True,
+        arm_sdk: bool = False,
         sim2sim: bool = False,
         arm_controller_backend: str = "mujoco",
         head_segmentation_proxy_endpoint: str | None = None,
@@ -665,6 +666,10 @@ class Manager:
         self._sim2sim = sim2sim
         self._head_segmentation_proxy_endpoint = head_segmentation_proxy_endpoint
         self._point_tracker_site_name = "d435_head"
+        self._tracked_points_pub_endpoint = TRACKED_POINTS_PUB_ENDPOINT
+        self._zmq_context = zmq.Context.instance()
+        self._tracked_points_pub_socket: zmq.Socket | None = None
+        self._tracked_points_publish_disabled = False
 
         self._rs_width, self._rs_height, self._rs_fps = 640, 480, 30
         self.msc = None
@@ -822,6 +827,44 @@ class Manager:
                 track_server_endpoint,
             )
 
+    def _ensure_tracked_points_pub_socket(self) -> zmq.Socket | None:
+        if (
+            self._tracked_points_pub_endpoint is None
+            or self._tracked_points_publish_disabled
+        ):
+            return None
+        if self._tracked_points_pub_socket is None:
+            sock = self._zmq_context.socket(zmq.PUB)
+            sock.setsockopt(zmq.SNDHWM, 1)
+            sock.bind(self._tracked_points_pub_endpoint)
+            self._tracked_points_pub_socket = sock
+        return self._tracked_points_pub_socket
+
+    def _reset_tracked_points_pub_socket(self) -> None:
+        if self._tracked_points_pub_socket is not None:
+            self._tracked_points_pub_socket.close(linger=0)
+        self._tracked_points_pub_socket = None
+
+    def _publish_tracked_points_world(
+        self, points_world: np.ndarray, visibility: np.ndarray
+    ) -> None:
+        sock = self._ensure_tracked_points_pub_socket()
+        if sock is None:
+            return
+        try:
+            sock.send_pyobj(
+                {
+                    "op": "tracked_points_world",
+                    "timestamp": time.time(),
+                    "points_world": np.asarray(points_world, dtype=np.float32),
+                    "visibility": np.asarray(visibility, dtype=bool),
+                }
+            )
+        except Exception as exc:
+            logging.warning("Tracked-points publish failed: %s", exc)
+            self._tracked_points_publish_disabled = True
+            self._reset_tracked_points_pub_socket()
+
     def setup_visualization(self) -> None:
         self.visualizer = ViserVisualizer()
         self.visualizer.add_robot(
@@ -894,6 +937,10 @@ class Manager:
         self.visualizer.set_tracker_points(
             tracked_points_world,
             colors=colors,
+        )
+        self._publish_tracked_points_world(
+            tracked_points_world,
+            np.asarray(tracked_visibility, dtype=bool),
         )
 
     def _wait_for_initial_pose(self, timeout_s: float) -> bool:
@@ -973,6 +1020,7 @@ class Manager:
                 self.head_segmentation_proxy.stop()
             if self.point_tracker_remote is not None:
                 self.point_tracker_remote.stop()
+            self._reset_tracked_points_pub_socket()
             if self.visualizer is not None:
                 self.visualizer.stop_async()
             if self.realsense_head is not None:
@@ -981,6 +1029,10 @@ class Manager:
             if self.realsense_wrist is not None:
                 print("Stopping RealSense wrist...")
                 self.realsense_wrist.stop()
+    
+    def run_async(self) -> None:
+        # TODO: implement this
+        pass
 
 
 def _parse_args() -> argparse.Namespace:
@@ -1001,7 +1053,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--head-segmentation-proxy-endpoint",
-        default="",
+        default="tcp://127.0.0.1:5562",
         help="If non-empty, bind a ZMQ REP server here for `segment_head` requests.",
     )
     parser.add_argument(
