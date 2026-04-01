@@ -420,6 +420,60 @@ class PointTrackerRemote:
             self._set_status("Cleared query points.")
             return self.query_overlay_rgb, self.status_message
 
+    def set_query_points(
+        self,
+        queries_xy: list[tuple[int, int]] | np.ndarray,
+        *,
+        capture_latest: bool = True,
+    ) -> tuple[np.ndarray | None, str]:
+        """Programmatically set pixel queries on a frozen RGB frame."""
+        points = np.asarray(queries_xy, dtype=np.int32)
+        if points.ndim != 2 or points.shape[1] != 2:
+            raise ValueError("queries_xy must have shape (N, 2)")
+        if len(points) == 0:
+            return self.clear_queries()
+        if len(points) > self.max_queries:
+            raise ValueError(
+                f"queries_xy has {len(points)} points, exceeding max_queries={self.max_queries}"
+            )
+
+        with self._lock:
+            if capture_latest or self.frozen_frame is None:
+                if self.latest_rgb_frame is None:
+                    self._set_status("Start the remote tracker first.")
+                    return None, self.status_message
+                self.frozen_frame = self.latest_rgb_frame.copy()
+
+            h, w = self.frozen_frame.shape[:2]
+            query_points_xy: list[tuple[int, int]] = []
+            for x_raw, y_raw in points.tolist():
+                x, y = int(x_raw), int(y_raw)
+                if not (0 <= x < w and 0 <= y < h):
+                    raise ValueError(
+                        f"query point {(x, y)} is outside image bounds {(w, h)}"
+                    )
+                query_points_xy.append((x, y))
+
+            self.query_points_xy = query_points_xy
+            self.query_overlay_rgb = self._render_query_image(
+                self.frozen_frame, self.query_points_xy
+            )
+            self._set_status(
+                f"Queries: {len(self.query_points_xy)}/{self.max_queries}. "
+                "Submit to start tracking."
+            )
+            return self.query_overlay_rgb, self.status_message
+
+    def submit_query_points(
+        self,
+        queries_xy: list[tuple[int, int]] | np.ndarray,
+        *,
+        capture_latest: bool = True,
+    ) -> str:
+        """Programmatically freeze a frame, set queries, and start tracking."""
+        self.set_query_points(queries_xy, capture_latest=capture_latest)
+        return self.submit_queries()
+
     def submit_queries(self) -> str:
         with self._lock:
             if self.frozen_frame is None or not self.query_points_xy:
