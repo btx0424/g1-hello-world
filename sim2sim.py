@@ -20,13 +20,14 @@ import mujoco.viewer
 import numpy as np
 
 from g1_hello_world.cameras import MujocoCameraStreamer
-from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelPublisher
+from g1_hello_world.constants import G1JointIndex
+from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelPublisher, ChannelSubscriber
 from unitree_sdk2py.idl.default import (
     unitree_go_msg_dds__SportModeState_,
     unitree_hg_msg_dds__LowState_,
 )
 from unitree_sdk2py.idl.unitree_go.msg.dds_ import SportModeState_
-from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_
+from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_, LowCmd_
 
 
 def _quat_wxyz_mul(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
@@ -254,26 +255,27 @@ class Sim2Sim:
             mujoco.mj_forward(self.model, self.data)
 
         assert self.model.nu == 29, "Only 29 hinge joints are supported"
+        self.kp = np.zeros(self.model.nu, dtype=np.float64)
         self.kd = np.zeros(self.model.nu, dtype=np.float64)
         self.kd.fill(self.default_damping)
+        self.tau_ff = np.zeros(self.model.nu, dtype=np.float64)
+        self.cmd_q = np.zeros(self.model.nu, dtype=np.float64)
+        self.cmd_dq = np.zeros(self.model.nu, dtype=np.float64)
 
         self._motor_actuator_ids = np.arange(self.model.nu, dtype=np.int32)
         self._actuator_joint_ids = np.array(
             [int(self.model.actuator_trnid[i, 0]) for i in self._motor_actuator_ids],
             dtype=np.int32,
         )
-        self._actuator_dof_adr = np.array(
+        self._actuator_qpos_adrrs = np.array(
+            [int(self.model.jnt_qposadr[j]) for j in self._actuator_joint_ids],
+            dtype=np.int32,
+        )
+        self._actuator_qvel_addrs = np.array(
             [int(self.model.jnt_dofadr[j]) for j in self._actuator_joint_ids],
             dtype=np.int32,
         )
-        self._tau_lim_lo = np.array(
-            [float(self.model.jnt_actfrcrange[j, 0]) for j in self._actuator_joint_ids],
-            dtype=np.float64,
-        )
-        self._tau_lim_hi = np.array(
-            [float(self.model.jnt_actfrcrange[j, 1]) for j in self._actuator_joint_ids],
-            dtype=np.float64,
-        )
+        
         self._motor_damping_event = threading.Event()
         self._motor_damping_event.set()
         self._gantry_enabled = True
@@ -304,6 +306,25 @@ class Sim2Sim:
         self.lowstate_publisher.Init()
         self.odom_publisher = ChannelPublisher("rt/odommodestate", SportModeState_)
         self.odom_publisher.Init()
+
+        # subscribe to rt/arm_sdk
+        self.arm_sdk_subscriber = ChannelSubscriber("rt/arm_sdk", LowCmd_)
+        self.arm_sdk_subscriber.Init(self.ArmSDKHandler)
+
+        self.arm_joints = [
+            G1JointIndex.LeftShoulderPitch,  G1JointIndex.LeftShoulderRoll,
+            G1JointIndex.LeftShoulderYaw,    G1JointIndex.LeftElbow,
+            G1JointIndex.LeftWristRoll,      G1JointIndex.LeftWristPitch,
+            G1JointIndex.LeftWristYaw,
+            G1JointIndex.RightShoulderPitch, G1JointIndex.RightShoulderRoll,
+            G1JointIndex.RightShoulderYaw,   G1JointIndex.RightElbow,
+            G1JointIndex.RightWristRoll,     G1JointIndex.RightWristPitch,
+            G1JointIndex.RightWristYaw,
+            G1JointIndex.WaistYaw,
+            G1JointIndex.WaistRoll,
+            G1JointIndex.WaistPitch
+        ]
+
         self.head_camera = MujocoCameraStreamer(
             self,
             camera_name="sim_head_camera",
@@ -327,16 +348,24 @@ class Sim2Sim:
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._viewer = None
+    
+    def ArmSDKHandler(self, msg: LowCmd_) -> None:
+        for i in self.arm_joints:
+            self.cmd_q[i] = msg.motor_cmd[i].q
+            self.cmd_dq[i] = msg.motor_cmd[i].dq
+            self.kp[i] = msg.motor_cmd[i].kp
+            self.kd[i] = msg.motor_cmd[i].kd
+            self.tau_ff[i] = msg.motor_cmd[i].tau
 
-    def _apply_motor_damping(self) -> None:
+    def _apply_motor_control(self) -> None:
         """Viscous damping via actuator control: ctrl = -b * qdot for all motor actuators."""
         d = self.data
-        if not self._motor_damping_event.is_set():
-            d.ctrl[self._motor_actuator_ids] = 0.0
-            return
-        dq = d.qvel[self._actuator_dof_adr]
-        tau = self.kd * (0.0 - dq)
-        tau = np.clip(tau, self._tau_lim_lo, self._tau_lim_hi)
+        q = d.qpos[self._actuator_qpos_adrrs]
+        dq = d.qvel[self._actuator_qvel_addrs]
+        if self._motor_damping_event.is_set():
+            tau = self.default_damping * (0.0 - dq)
+        else:
+            tau = self.kd * (self.cmd_dq - dq) + self.kp * (self.cmd_q - q) + self.tau_ff
         d.ctrl[self._motor_actuator_ids] = tau
 
     def _viewer_key_callback(self, key: int) -> None:
@@ -346,7 +375,7 @@ class Sim2Sim:
                 print("Motor damping: OFF")
             else:
                 self._motor_damping_event.set()
-                print(f"Motor damping: ON (b={self.kd:g} N·m·s/rad)")
+                print(f"Motor damping: ON (b={self.default_damping:g} N·m·s/rad)")
         elif key == glfw.KEY_G:
             with self.lock:
                 self._gantry_enabled = not self._gantry_enabled
@@ -404,8 +433,8 @@ class Sim2Sim:
                 continue
 
             with self.lock:
-                self._apply_motor_damping()
                 self._apply_gantry_tendon_state()
+                self._apply_motor_control()
                 mujoco.mj_step(self.model, self.data)
             next_step_t += self._sim_dt
 
