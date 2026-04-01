@@ -151,6 +151,64 @@ def _build_sim_xml(base_xml_path: Path) -> str:
             },
         )
 
+    gantry_body = worldbody.find("./body[@name='gantry']")
+    if gantry_body is None:
+        gantry_body = ET.SubElement(
+            worldbody,
+            "body",
+            {
+                "name": "gantry",
+                "mocap": "true",
+                "pos": "0 0 1.5",
+            },
+        )
+    if gantry_body.find("./site[@name='gantry_hook']") is None:
+        ET.SubElement(
+            gantry_body,
+            "site",
+            {
+                "name": "gantry_hook",
+                "type": "sphere",
+                "size": "0.012",
+                "pos": "0 0 0.1",
+                "rgba": "0.8 0.2 0.2 1",
+            },
+        )
+
+    tendon = root.find("tendon")
+    if tendon is None:
+        tendon = ET.SubElement(root, "tendon")
+
+    if tendon.find("./spatial[@name='left_gantry_tendon']") is None:
+        left = ET.SubElement(
+            tendon,
+            "spatial",
+            {
+                "name": "left_gantry_tendon",
+                "width": "0.004",
+                "stiffness": "1500",
+                "damping": "60",
+                "rgba": "0.2 0.7 1.0 1",
+            },
+        )
+        ET.SubElement(left, "site", {"site": "gantry_hook"})
+        ET.SubElement(left, "site", {"site": "left_gantry_attach_point"})
+
+    if tendon.find("./spatial[@name='right_gantry_tendon']") is None:
+        right = ET.SubElement(
+            tendon,
+            "spatial",
+            {
+                "name": "right_gantry_tendon",
+                "width": "0.004",
+                "stiffness": "1500",
+                "damping": "60",
+                "rgba": "0.2 0.7 1.0 1",
+            },
+        )
+        ET.SubElement(right, "site", {"site": "gantry_hook"})
+        ET.SubElement(right, "site", {"site": "right_gantry_attach_point"})
+
     return ET.tostring(root, encoding="unicode")
 
 
@@ -180,6 +238,7 @@ class Sim2Sim:
 
         xml_text = _build_sim_xml(self._xml_path)
         spec = mujoco.MjSpec.from_string(xml_text)
+
         for joint in spec.joints:
             joint: mujoco.MjsJoint
             joint.damping = 0.4
@@ -217,6 +276,29 @@ class Sim2Sim:
         )
         self._motor_damping_event = threading.Event()
         self._motor_damping_event.set()
+        self._gantry_enabled = True
+        self._gantry_tendon_ids = np.array(
+            [
+                mujoco.mj_name2id(
+                    self.model, mujoco.mjtObj.mjOBJ_TENDON, "left_gantry_tendon"
+                ),
+                mujoco.mj_name2id(
+                    self.model, mujoco.mjtObj.mjOBJ_TENDON, "right_gantry_tendon"
+                ),
+            ],
+            dtype=np.int32,
+        )
+        if np.any(self._gantry_tendon_ids < 0):
+            raise RuntimeError(
+                "Failed to find gantry tendons in compiled model. "
+                "Expected left_gantry_tendon and right_gantry_tendon."
+            )
+        self._gantry_stiffness_on = np.asarray(
+            self.model.tendon_stiffness[self._gantry_tendon_ids], dtype=np.float64
+        ).copy()
+        self._gantry_damping_on = np.asarray(
+            self.model.tendon_damping[self._gantry_tendon_ids], dtype=np.float64
+        ).copy()
 
         self.lowstate_publisher = ChannelPublisher("rt/lowstate", LowState_)
         self.lowstate_publisher.Init()
@@ -265,6 +347,23 @@ class Sim2Sim:
             else:
                 self._motor_damping_event.set()
                 print(f"Motor damping: ON (b={self.kd:g} N·m·s/rad)")
+        elif key == glfw.KEY_G:
+            with self.lock:
+                self._gantry_enabled = not self._gantry_enabled
+                self._apply_gantry_tendon_state()
+                mujoco.mj_forward(self.model, self.data)
+            print(f"Gantry tendons: {'ON' if self._gantry_enabled else 'OFF'}")
+
+    def _apply_gantry_tendon_state(self) -> None:
+        if self._gantry_enabled:
+            self.model.tendon_stiffness[self._gantry_tendon_ids] = (
+                self._gantry_stiffness_on
+            )
+            self.model.tendon_damping[self._gantry_tendon_ids] = self._gantry_damping_on
+        else:
+            self.model.tendon_stiffness[self._gantry_tendon_ids] = 0.0
+            self.model.tendon_damping[self._gantry_tendon_ids] = 0.0
+
     def _init_pose(self) -> None:
         self.data.qpos[:] = 0.0
         self.data.qvel[:] = 0.0
@@ -306,6 +405,7 @@ class Sim2Sim:
 
             with self.lock:
                 self._apply_motor_damping()
+                self._apply_gantry_tendon_state()
                 mujoco.mj_step(self.model, self.data)
             next_step_t += self._sim_dt
 

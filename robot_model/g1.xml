@@ -196,6 +196,16 @@
           <joint name="waist_roll_joint" axis="1 0 0" range="-0.52 0.52" armature="0.00721945"/>
           <geom class="visual" mesh="waist_roll_link"/>
           <body name="torso_link">
+
+            <body name="left_gantry_attach" pos="0.0 0.1 0.2" quat="1 0 0 0">
+              <geom type="sphere" size="0.01" pos="0.0 0 0"/>
+              <site name="left_gantry_attach_point" size="0.01" pos="0.0 0 0"/>
+            </body>
+            <body name="right_gantry_attach" pos="0.0 -0.1 0.2" quat="1 0 0 0">
+              <geom type="sphere" size="0.01" pos="0.0 0 0"/>
+              <site name="right_gantry_attach_point" size="0.01" pos="0.0 0 0"/>
+            </body>
+
             <inertial pos="0.00203158 0.000339683 0.184568" quat="0.999803 -6.03319e-05 0.0198256 0.00131986"
               mass="7.818" diaginertia="0.121847 0.109825 0.0273735"/>
             <joint name="waist_pitch_joint" axis="0 1 0" range="-0.52 0.52" armature="0.00721945"/>
