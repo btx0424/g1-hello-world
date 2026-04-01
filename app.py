@@ -6,6 +6,7 @@ import itertools
 import threading
 import time
 
+import mujoco
 import numpy as np
 import trimesh
 import logging
@@ -21,6 +22,7 @@ from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_, LowCmd_
 from unitree_sdk2py.utils.crc import CRC
 
 from g1_hello_world.constants import (
+    G1JointIndex,
     R_SITE_FROM_OPENCV,
     T_LEFT_WRIST_LINK_END_TO_RGB_PLACEHOLDER,
     T_LEFT_WRIST_YAW_TO_LINK_END,
@@ -34,6 +36,177 @@ from g1_hello_world.utils.timerfd import Timer
 
 HEAD_SERIAL = "347622073775"
 WRIST_SERIAL = "236422074588"
+
+
+class ArmController:
+    """Left-arm orientation IK for the no-tracking case."""
+
+    def __init__(
+        self,
+        *,
+        robot_model: RobotModelWrapper,
+        arm_sdk_publisher: ChannelPublisher,
+        low_cmd: LowCmd_,
+        crc: CRC,
+    ) -> None:
+        self._robot_model = robot_model
+        self._arm_sdk_publisher = arm_sdk_publisher
+        self._low_cmd = low_cmd
+        self._crc = crc
+        self._arm_joint_indices, self._arm_joint_names = self._robot_model.find_joints(
+            ["left_(shoulder|elbow|wrist).*"]
+        )
+        self._arm_kp = 28.0
+        self._arm_kd = 1.8
+        self._look_gain = 1.2
+        self._task_damping = 0.20
+        self._joint_damping = 0.45
+        self._null_gain = 0.12
+        self._step_size = 0.12
+        self._dq_limit = 0.018
+        self._cmd_alpha = 0.10
+        self._world_up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        self._nominal_pose = np.array(
+            [0.30, 0.55, 0.0, 1.05, 0.0, -0.35, 0.0],
+            dtype=np.float64,
+        )
+        m = self._robot_model.mj_model
+        mj_joint_ids = [sdk_i + 1 for sdk_i in self._arm_joint_indices]
+        self._arm_dof_cols = np.array(
+            [int(m.jnt_dofadr[jid]) for jid in mj_joint_ids],
+            dtype=np.int32,
+        )
+        self._joint_lo = np.array([m.jnt_range[jid, 0] for jid in mj_joint_ids], dtype=np.float64)
+        self._joint_hi = np.array([m.jnt_range[jid, 1] for jid in mj_joint_ids], dtype=np.float64)
+        self._wrist_site_id = mujoco.mj_name2id(
+            m, mujoco.mjtObj.mjOBJ_SITE, "d435_wrist"
+        )
+        self._jacp_buf = np.zeros((3, m.nv), dtype=np.float64)
+        self._jacr_buf = np.zeros((3, m.nv), dtype=np.float64)
+        self._q_cmd = self._nominal_pose.copy()
+        self._initialized = False
+
+    def _compute_orientation_dq(
+        self,
+        *,
+        forward_des: np.ndarray,
+        jpos: np.ndarray,
+        jvel: np.ndarray,
+    ) -> np.ndarray:
+        q_arm = np.asarray(jpos[self._arm_joint_indices], dtype=np.float64)
+        dq_arm = np.asarray(jvel[self._arm_joint_indices], dtype=np.float64)
+        _, world_from_wrist = self._robot_model.get_site_frame("d435_wrist")
+        norm_forward = np.linalg.norm(forward_des)
+        if norm_forward < 1e-6:
+            forward_des = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+        else:
+            forward_des /= norm_forward
+
+        up_des = self._world_up - float(self._world_up @ forward_des) * forward_des
+        norm_up = np.linalg.norm(up_des)
+        if norm_up < 1e-6:
+            up_des = world_from_wrist[:, 2].copy()
+            up_des -= float(up_des @ forward_des) * forward_des
+            norm_up = np.linalg.norm(up_des)
+        if norm_up < 1e-6:
+            up_des = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+            up_des -= float(up_des @ forward_des) * forward_des
+            up_des /= np.linalg.norm(up_des) + 1e-9
+        else:
+            up_des /= norm_up
+
+        left_des = np.cross(up_des, forward_des)
+        left_des /= np.linalg.norm(left_des) + 1e-9
+        up_des = np.cross(forward_des, left_des)
+        up_des /= np.linalg.norm(up_des) + 1e-9
+
+        rot_des = np.column_stack((forward_des, left_des, up_des))
+        omega = 0.5 * (
+            np.cross(world_from_wrist[:, 0], rot_des[:, 0])
+            + np.cross(world_from_wrist[:, 1], rot_des[:, 1])
+            + np.cross(world_from_wrist[:, 2], rot_des[:, 2])
+        )
+
+        mujoco.mj_jacSite(
+            self._robot_model.mj_model,
+            self._robot_model.mj_data,
+            self._jacp_buf,
+            self._jacr_buf,
+            self._wrist_site_id,
+        )
+        j_rot = self._jacr_buf[:, self._arm_dof_cols]
+        task = self._look_gain * omega - self._joint_damping * (j_rot @ dq_arm)
+        lhs = j_rot @ j_rot.T + self._task_damping * np.eye(3, dtype=np.float64)
+        dq_task = j_rot.T @ np.linalg.solve(lhs, task)
+
+        eye = np.eye(len(self._arm_joint_indices), dtype=np.float64)
+        null_proj = eye - j_rot.T @ np.linalg.solve(lhs, j_rot)
+        dq_null = null_proj @ (self._null_gain * (self._nominal_pose - q_arm))
+        dq = self._step_size * (dq_task + dq_null)
+        return np.clip(dq, -self._dq_limit, self._dq_limit)
+
+    def _compute_no_target_dq(
+        self,
+        *,
+        jpos: np.ndarray,
+        jvel: np.ndarray,
+    ) -> np.ndarray:
+        _, world_from_torso = self._robot_model.get_body_frame("torso_link")
+        forward_des = world_from_torso[:, 0].copy()
+        forward_des -= float(forward_des @ self._world_up) * self._world_up
+        return self._compute_orientation_dq(
+            forward_des=forward_des,
+            jpos=jpos,
+            jvel=jvel,
+        )
+
+    def step(
+        self,
+        *,
+        points: np.ndarray | None,
+        jpos: np.ndarray,
+        jvel: np.ndarray,
+    ) -> None:
+        # Case 1 only for now: ignore points and make the wrist look forward.
+        if not self._initialized:
+            self._q_cmd = np.asarray(jpos[self._arm_joint_indices], dtype=np.float64).copy()
+            self._initialized = True
+        if points is None:
+            dq_cmd = self._compute_no_target_dq(jpos=jpos, jvel=jvel)
+        else:
+            points_world = np.asarray(points, dtype=np.float64)
+            valid = np.all(np.isfinite(points_world), axis=1)
+            pos_wrist, world_from_wrist = self._robot_model.get_site_frame("d435_wrist")
+            if np.any(valid):
+                center_world = np.mean(points_world[valid], axis=0)
+                forward_des = center_world - pos_wrist
+            else:
+                forward_des = world_from_wrist[:, 0].copy()
+            dq_cmd = self._compute_orientation_dq(
+                forward_des=forward_des,
+                jpos=jpos,
+                jvel=jvel,
+            )
+        q_des = self._q_cmd + dq_cmd
+        q_des = np.clip(q_des, self._joint_lo, self._joint_hi)
+        self._q_cmd = (1.0 - self._cmd_alpha) * self._q_cmd + self._cmd_alpha * q_des
+        self._q_cmd = np.clip(self._q_cmd, self._joint_lo, self._joint_hi)
+
+        self._low_cmd.motor_cmd[G1JointIndex.kNotUsedJoint].q = 1.0
+        for i in range(29):
+            self._low_cmd.motor_cmd[i].tau = 0.0
+            self._low_cmd.motor_cmd[i].dq = 0.0
+            self._low_cmd.motor_cmd[i].kp = 0.0
+            self._low_cmd.motor_cmd[i].kd = 0.0
+            self._low_cmd.motor_cmd[i].q = float(jpos[i])
+
+        for k, sdk_i in enumerate(self._arm_joint_indices):
+            self._low_cmd.motor_cmd[sdk_i].kp = self._arm_kp
+            self._low_cmd.motor_cmd[sdk_i].kd = self._arm_kd
+            self._low_cmd.motor_cmd[sdk_i].q = float(self._q_cmd[k])
+
+        self._low_cmd.crc = self._crc.Crc(self._low_cmd)
+        self._arm_sdk_publisher.Write(self._low_cmd)
 
 class Manager:
     def __init__(
@@ -108,6 +281,9 @@ class Manager:
         self._qpos = np.zeros(self.robot_model.mj_model.nq, dtype=np.float64)
         self._qpos[3] = 1.0  # floating base quaternion w (identity), MuJoCo qpos[3:7] wxyz
         self.robot_model.update(self._qpos)
+        self.jpos = np.zeros(29, dtype=np.float64)
+        self.jvel = np.zeros(29, dtype=np.float64)
+        self.quat_wxyz = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
         self.imu_rpy = np.zeros(3, dtype=np.float64)
 
         self._initial_odom = threading.Event()
@@ -120,8 +296,15 @@ class Manager:
             self.arm_sdk_publisher.Init()
             self.low_cmd = unitree_hg_msg_dds__LowCmd_()
             self.crc = CRC()
+            self.arm_controller = ArmController(
+                robot_model=self.robot_model,
+                arm_sdk_publisher=self.arm_sdk_publisher,
+                low_cmd=self.low_cmd,
+                crc=self.crc,
+            )
         else:
             self.arm_sdk_publisher = None
+            self.arm_controller = None
 
         self.lowstate_subscriber = ChannelSubscriber("rt/lowstate", LowState_)
         self.lowstate_subscriber.Init(self.LowStateHandler, 0)
@@ -278,40 +461,10 @@ class Manager:
         self._initial_odom.set()
 
     def compute_arm_control(self, points: np.ndarray | None) -> None:
-        # Left arm only; leave the right arm as reported by LowState (no separate right-arm goals).
-        #
-        # Resolving the chain:
-        #   arm_joint_indices, _ = self.robot_model.find_joints(
-        #       ["left_(shoulder|elbow|wrist).*"]
-        #   )
-        #   typ. SDK indices [15, 16, 17, 18, 19, 20, 21] for
-        #   ['left_shoulder_pitch_joint', 'left_shoulder_roll_joint', 'left_shoulder_yaw_joint',
-        #    'left_elbow_joint', 'left_wrist_roll_joint', 'left_wrist_pitch_joint',
-        #    'left_wrist_yaw_joint']
-        #   MuJoCo hinge joint ids are i+1 (joint 0 is the free joint); map to dof columns via
-        #   mj_model.jnt_dofadr[joint_id].
-        #
-        # Use self.jpos / self.jvel and Jacobians from self.robot_model.mj_data after update().
-        #
-        # Task specification:
-        #   1. points is None — gaze: desired wrist “look” direction follows pelvis forward in body
-        #      (_pelvis_forward_body, e.g. [1,0,0] in pelvis frame), rotated by IMU like _qpos[3:7],
-        #      then projected to the horizontal plane (normal _world_horizontal_normal).
-        #   2. points is not None — tracking: steer left_wrist_yaw_link (camera bore via
-        #      get_site_frame("d435_wrist")) so the optical axis aims at the centroid of points
-        #      in world (transform points from link frame to world first).
-        #
-        # Shared secondary objectives:
-        #   - Align link +Z with world “right” [0, -1, 0] (_world_up).
-        #   - Regulate wrist height: keep wrist origin at _wrist_height_in_root (m) along pelvis +Z.
-        #
-        # Implementation hints (removed here): differential IK / task-space errors → Δq for the
-        # left-arm dof columns; smooth and integrate to q_cmd; fill self.low_cmd (kp/kd, q, dq for
-        # left arm; mirror measured q for other joints); set CRC; self.arm_sdk_publisher.Write(...).
-        # Floating-base quat in LowState is wxyz; if gaze heading is mirrored, try conjugating
-        # before body→world. For moving targets, EMA + short lead time on the 3D point helps during gait.
-        if self.arm_sdk_publisher is None:
+        if self.arm_controller is None:
             return
+        points = np.array([[1.2, 0.0, 0.8]], dtype=np.float64) # for testing
+        self.arm_controller.step(points=points, jpos=self.jpos, jvel=self.jvel)
 
     def run(self) -> None:
         timer = Timer(0.02)
@@ -372,7 +525,11 @@ def _parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = _parse_args()
-    ChannelFactoryInitialize(0, args.iface)
+    if args.sim2sim:
+        iface = "lo"
+    else:
+        iface = args.iface
+    ChannelFactoryInitialize(0, iface)
 
     # Real robot:
     #   uv run app.py --iface eth0
