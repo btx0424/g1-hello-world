@@ -20,6 +20,8 @@ import zmq
 from g1_hello_world.constants import R_SITE_FROM_OPENCV
 from g1_hello_world.cameras import RealSenseDeviceManager
 
+TRACKED_POINTS_PUB_ENDPOINT = "tcp://127.0.0.1:5560"
+
 
 def encode_rgb_jpeg(rgb: np.ndarray, quality: int) -> bytes:
     ok, encoded = cv2.imencode(
@@ -56,6 +58,7 @@ class PointTrackerRemote:
         max_queries: int = 8,
     ) -> None:
         self.server_endpoint = server_endpoint
+        self.tracked_points_pub_endpoint = TRACKED_POINTS_PUB_ENDPOINT
         self._rs = realsense_device
         self._aligned_read_timeout_s = float(aligned_read_timeout_s)
         self._poll_period_s = poll_period_s
@@ -89,6 +92,8 @@ class PointTrackerRemote:
 
         self._context: zmq.Context | None = None
         self._socket: zmq.Socket | None = None
+        self._publish_socket: zmq.Socket | None = None
+        self._publish_disabled: bool = False
 
     # --- ZMQ (same shape as OffboardClientSession in client.py) ---
 
@@ -110,6 +115,45 @@ class PointTrackerRemote:
         if self._socket is not None:
             self._socket.close(linger=0)
         self._socket = None
+        self._reset_publish_socket()
+
+    def _ensure_publish_socket(self) -> zmq.Socket | None:
+        if self.tracked_points_pub_endpoint is None or self._publish_disabled:
+            return None
+        if self._context is None:
+            self._context = zmq.Context.instance()
+        if self._publish_socket is None:
+            sock = self._context.socket(zmq.PUB)
+            sock.setsockopt(zmq.SNDHWM, 1)
+            sock.bind(self.tracked_points_pub_endpoint)
+            self._publish_socket = sock
+        return self._publish_socket
+
+    def _reset_publish_socket(self) -> None:
+        if self._publish_socket is not None:
+            self._publish_socket.close(linger=0)
+        self._publish_socket = None
+
+    def _publish_tracked_points_link(
+        self, points_link: np.ndarray, visibility: np.ndarray
+    ) -> None:
+        sock = self._ensure_publish_socket()
+        if sock is None:
+            return
+        try:
+            sock.send_pyobj(
+                {
+                    "op": "tracked_points_link",
+                    "timestamp": time.time(),
+                    "points_link": np.asarray(points_link, dtype=np.float32),
+                    "visibility": np.asarray(visibility, dtype=bool),
+                }
+            )
+        except Exception as exc:
+            with self._lock:
+                self._set_status(f"Tracked-points publish failed: {exc}")
+            self._publish_disabled = True
+            self._reset_publish_socket()
 
     def _request(self, payload: dict[str, Any]) -> dict[str, Any]:
         with self._request_lock:
@@ -225,6 +269,9 @@ class PointTrackerRemote:
                         self.tracked_points = tracked_points
                         self.tracked_visibility = tracked_visibility
                         self.tracked_points_link = tracked_points_link
+                    self._publish_tracked_points_link(
+                        tracked_points_link, tracked_visibility
+                    )
                 else:
                     with self._lock:
                         self._set_status(
